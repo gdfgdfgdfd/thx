@@ -23,7 +23,7 @@ extension Color {
 }
 
 /// SwiftUI colours and fonts for the active theme.
-struct Palette {
+struct Palette: Equatable {
     let theme: Theme
     let fontSize: Double
 
@@ -34,6 +34,10 @@ struct Palette {
     var error: Color { Color(hex: theme.error) }
     var success: Color { Color(hex: theme.success) }
     var code: Color { Color(hex: theme.codeBackground) }
+    /// Fill behind the user's own prompts.
+    var bubble: Color { accent.opacity(0.16) }
+    /// Hairline around cards.
+    var edge: Color { dim.opacity(0.22) }
 
     var font: Font { .system(size: fontSize, design: .monospaced) }
     var small: Font { .system(size: max(fontSize - 2, 9), design: .monospaced) }

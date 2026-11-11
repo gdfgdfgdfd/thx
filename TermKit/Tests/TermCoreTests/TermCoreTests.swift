@@ -262,7 +262,7 @@ final class TermCoreTests: XCTestCase {
     func testMarkdownSegmentsAndExport() {
         XCTAssertEqual(Markdown.segments("intro\n\n```sh\nls -la\n\necho hi\n```\nafter"), [
             .init(isCode: false, text: "intro"),
-            .init(isCode: true, text: "ls -la\n\necho hi"),
+            .init(isCode: true, text: "ls -la\n\necho hi", language: "sh"),
             .init(isCode: false, text: "after"),
         ])
         // A fence still open while streaming renders as code.
@@ -274,6 +274,82 @@ final class TermCoreTests: XCTestCase {
             TranscriptItem(kind: .tool, text: "up 3 days", title: "ssh box $ uptime"), TranscriptItem(kind: .assistant, text: "fine"),
         ])
         XCTAssertEqual(Markdown.export(session), "# t\n\n**❯ hi**\n\n```\nssh box $ uptime\nup 3 days\n```\n\nfine\n")
+    }
+
+    func testMarkdownLines() {
+        typealias Line = Markdown.Line
+        XCTAssertEqual(Markdown.lines("## Plan\n- one\n  * nested\n2) two\n> note\n---\n**bold** text\n1.5 times\n-x"), [
+            Line(kind: .heading, text: "Plan"),
+            Line(kind: .bullet, text: "one", marker: "•"),
+            Line(kind: .bullet, text: "nested", marker: "•", indent: 1),
+            Line(kind: .numbered, text: "two", marker: "2."),
+            Line(kind: .quote, text: "note"),
+            Line(kind: .rule, text: ""),
+            Line(kind: .text, text: "**bold** text"),
+            Line(kind: .text, text: "1.5 times"),
+            Line(kind: .text, text: "-x"),
+        ])
+        // Blank lines survive so paragraphs keep their spacing.
+        XCTAssertEqual(Markdown.lines("a\n\nb").map(\.text), ["a", "", "b"])
+    }
+
+    func testTranscriptGroupsToolRunsAndSummarisesOutput() {
+        let items = [
+            TranscriptItem(kind: .user, text: "go"), TranscriptItem(kind: .tool, text: "1"), TranscriptItem(kind: .tool, text: "2"),
+            TranscriptItem(kind: .assistant, text: "mid"), TranscriptItem(kind: .tool, text: "3"), TranscriptItem(kind: .assistant, text: "end"),
+        ]
+        let groups = Transcript.groups(items)
+        XCTAssertEqual(groups.map { $0.items.map(\.text) }, [["go"], ["1", "2"], ["mid"], ["3"], ["end"]])
+        XCTAssertEqual(groups.map(\.isActivity), [false, true, false, true, false])
+        // A list keeps its identity as calls are added, so the view is updated rather than replaced.
+        XCTAssertEqual(groups[1].id, items[1].id)
+        XCTAssertEqual(Transcript.groups([]), [])
+
+        XCTAssertEqual(Transcript.preview("a\nb\n\n"), "b")
+        XCTAssertEqual(Transcript.preview("nginx: unknown directive\n[exit 3]"), "nginx: unknown directive  [exit 3]")
+        XCTAssertEqual(Transcript.preview("[exit 1]"), "[exit 1]")
+        XCTAssertNil(Transcript.preview(" \n"))
+        XCTAssertEqual(Transcript.lineCount("a\nb\n"), 2)
+        XCTAssertEqual(Transcript.tail("1\n2\n3\n4", lines: 2), "… 2 earlier lines\n3\n4")
+        XCTAssertEqual(Transcript.tail("1\n2", lines: 2), "1\n2")
+    }
+
+    func testAttachmentsAreCopiedIntoTheWorkspaceAndSentWithThePrompt() throws {
+        let outside = FileManager.default.temporaryDirectory.appendingPathComponent("picked-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outside) }
+        let note = outside.appendingPathComponent("note.txt")
+        try Data("use ```fences```".utf8).write(to: note)
+        let binary = outside.appendingPathComponent("photo.bin")
+        try Data([0xFF, 0xD8, 0x00, 0x10]).write(to: binary)
+
+        let first = try Attachments.importFile(at: note, into: workspace)
+        let second = try Attachments.importFile(at: note, into: workspace)
+        let third = try Attachments.importFile(at: binary, into: workspace)
+        XCTAssertEqual([first.path, second.path, third.path], ["uploads/note.txt", "uploads/note-2.txt", "uploads/photo.bin"])
+        XCTAssertEqual(first.text, "use ```fences```")
+        XCTAssertEqual(first.size, 16)
+        XCTAssertNil(third.text)
+
+        // The copy is where the agent's file tools can read it.
+        let read = try ToolBox(workspace: workspace, shell: nil).resolve(first.path)
+        XCTAssertEqual(try String(contentsOf: read, encoding: .utf8), "use ```fences```")
+        XCTAssertEqual(try Attachments.load(second.path, in: workspace).text, first.text)
+
+        XCTAssertEqual(Attachments.prompt("hi", attachments: []), "hi")
+        // The fence is longer than any run of backticks in the file, so the contents cannot close it early.
+        XCTAssertEqual(Attachments.prompt("check this", attachments: [first]),
+                       "check this\n\n[attached file: uploads/note.txt]\n````\nuse ```fences```\n````")
+        let binaryOnly = Attachments.prompt("", attachments: [third])
+        XCTAssertTrue(binaryOnly.hasPrefix("[attached file: uploads/photo.bin, 4 bytes."), binaryOnly)
+    }
+
+    func testSessionsSavedBeforePromptLinksStillLoad() throws {
+        let json = #"{"id":"5B0E1A62-7C2F-4E7B-9A53-1C0D6F2E8A11","kind":"user","text":"old prompt"}"#
+        let item = try JSONDecoder().decode(TranscriptItem.self, from: Data(json.utf8))
+        XCTAssertEqual(item.text, "old prompt")
+        XCTAssertNil(item.messageIndex)
+        XCTAssertNil(item.attachments)
     }
 
     func testToolOutputArrivesInOrderBeforeTheResult() async throws {

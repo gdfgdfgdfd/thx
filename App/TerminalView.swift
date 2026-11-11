@@ -1,42 +1,67 @@
 import SwiftUI
 import TermCore
 import UIKit
+import UniformTypeIdentifiers
 
 struct TerminalView: View {
     @Environment(AppModel.self) private var model
     @FocusState private var inputFocused: Bool
+    @State private var topHeight: CGFloat = 0
+    @State private var bottomHeight: CGFloat = 0
 
     var body: some View {
         @Bindable var model = model
         let palette = model.palette
 
-        VStack(spacing: 0) {
-            StatusBar()
-            Rectangle().fill(palette.dim.opacity(0.3)).frame(height: 1)
-            TranscriptView()
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            BottomBar(inputFocused: $inputFocused)
+        ZStack {
+            // The transcript runs underneath both bars, so the glass has content to pick up.
+            TranscriptView(topInset: topHeight, bottomInset: bottomHeight)
+            VStack(spacing: 0) {
+                TopBar()
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { topHeight = $0 }
+                Spacer(minLength: 0)
+                Composer(inputFocused: $inputFocused)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { bottomHeight = $0 }
+            }
         }
         .background(palette.background.ignoresSafeArea())
         .preferredColorScheme(model.theme.isDark ? .dark : .light)
         .sheet(isPresented: $model.showSettings) {
             SettingsView()
         }
+        .sheet(isPresented: $model.showSessions) {
+            SessionsView()
+        }
         .sheet(item: $model.shareItem) { item in
             ShareSheet(text: item.text)
+        }
+        .fileImporter(isPresented: $model.showFilePicker, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls): model.attach(urls)
+            case .failure(let error): model.fail("file picker: \(error.localizedDescription)")
+            }
         }
     }
 }
 
-// MARK: Status bar
+// MARK: Top bar
 
-private struct StatusBar: View {
+private struct TopBar: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         let palette = model.palette
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
+            Button {
+                model.openSessions()
+            } label: {
+                Image(systemName: "rectangle.stack")
+                    .foregroundStyle(palette.text)
+                    .frame(width: Metrics.barHeight, height: Metrics.barHeight)
+                    .glass(in: Circle(), interactive: true)
+            }
+            .accessibilityLabel("Sessions")
+
             Menu {
                 ForEach(model.profiles) { profile in
                     Section(profile.name) {
@@ -55,13 +80,20 @@ private struct StatusBar: View {
                 }
                 Button("Settings…") { model.showSettings = true }
             } label: {
-                HStack(spacing: 6) {
-                    Text("●").foregroundStyle(model.isRunning ? palette.accent : palette.success)
-                    Text(profileLabel).foregroundStyle(palette.text).lineLimit(1).truncationMode(.middle)
+                HStack(spacing: 7) {
+                    Circle()
+                        .fill(model.isRunning ? palette.accent : palette.success)
+                        .frame(width: 7, height: 7)
+                    Text(modelLabel).foregroundStyle(palette.text).lineLimit(1).truncationMode(.middle)
+                    Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(palette.dim)
                 }
+                .padding(.horizontal, 14)
+                .frame(height: Metrics.barHeight)
+                .glass(in: Capsule(), interactive: true)
             }
+            .accessibilityLabel("Model: \(modelLabel)")
 
-            Spacer(minLength: 4)
+            Spacer(minLength: 0)
 
             Menu {
                 ForEach(model.hosts) { host in
@@ -80,305 +112,47 @@ private struct StatusBar: View {
                 Text(model.activeHost.map { "⇄ \($0.name)" } ?? "⇄ off")
                     .foregroundStyle(model.activeHost == nil ? palette.dim : palette.accent)
                     .lineLimit(1)
+                    .frame(maxWidth: 110)
+                    .fixedSize()
+                    .padding(.horizontal, 12)
+                    .frame(height: Metrics.barHeight)
+                    .glass(in: Capsule(), interactive: true)
             }
+            .accessibilityLabel(model.activeHost.map { "SSH host: \($0.name)" } ?? "SSH host: off")
 
             Button {
                 model.showSettings = true
             } label: {
-                Image(systemName: "gearshape").foregroundStyle(palette.dim)
+                Image(systemName: "gearshape")
+                    .foregroundStyle(palette.text)
+                    .frame(width: Metrics.barHeight, height: Metrics.barHeight)
+                    .glass(in: Circle(), interactive: true)
             }
             .accessibilityLabel("Settings")
         }
         .font(palette.small)
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-    }
-
-    private var profileLabel: String {
-        guard let profile = model.activeProfile else { return "no profile · /setup" }
-        return "\(profile.name) · \(model.activeModel ?? "no model")"
-    }
-}
-
-// MARK: Transcript
-
-private struct TranscriptView: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        let palette = model.palette
-        GeometryReader { geometry in
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(model.session.transcript) { item in
-                            ItemView(item: item, palette: palette)
-                        }
-                        if model.isRunning, model.pendingApproval == nil {
-                            Text("▍").font(palette.font).foregroundStyle(palette.accent)
-                        } else if let usage = model.usageLine {
-                            Text(usage).font(palette.small).foregroundStyle(palette.dim)
-                        }
-                        Color.clear.frame(height: 1).id("bottom")
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    // A short transcript starts at the top, like a fresh terminal, rather than hugging the input.
-                    .frame(maxWidth: .infinity, minHeight: geometry.size.height, alignment: .topLeading)
-                    .shadow(color: model.theme.glow ? palette.text.opacity(0.55) : .clear, radius: 3)
-                }
-                // Stay pinned to the newest output while it streams, unless the user scrolls up.
-                .defaultScrollAnchor(.bottom)
-                .scrollDismissesKeyboard(.interactively)
-                .onChange(of: model.scrollTick) {
-                    proxy.scrollTo("bottom", anchor: .bottom)
-                }
-            }
-        }
-    }
-}
-
-private struct ItemView: View {
-    let item: TranscriptItem
-    let palette: Palette
-
-    var body: some View {
-        switch item.kind {
-        case .user:
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("❯").foregroundStyle(palette.accent)
-                Text(item.text).foregroundStyle(palette.text).textSelection(.enabled)
-            }
-            .font(palette.bold)
-        case .assistant:
-            VStack(alignment: .leading, spacing: 8) {
-                ForEach(Array(Markdown.segments(item.text).enumerated()), id: \.offset) { _, segment in
-                    if segment.isCode {
-                        CodeBlock(code: segment.text, palette: palette)
-                    } else {
-                        Text(segment.text).font(palette.font).foregroundStyle(palette.text).textSelection(.enabled)
-                    }
-                }
-            }
-        case .tool:
-            ToolBlock(item: item, palette: palette)
-        case .info:
-            Text(item.text).font(palette.font).foregroundStyle(palette.dim).textSelection(.enabled)
-        case .error:
-            Text(item.text).font(palette.font).foregroundStyle(palette.error).textSelection(.enabled)
-        }
-    }
-}
-
-private struct CodeBlock: View {
-    let code: String
-    let palette: Palette
-
-    var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            Text(code).font(palette.font).foregroundStyle(palette.text).textSelection(.enabled)
-                .padding(.vertical, 8)
-                .padding(.leading, 10)
-                .padding(.trailing, 44)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(palette.code, in: RoundedRectangle(cornerRadius: 6))
-        .overlay(alignment: .topTrailing) {
-            Button {
-                UIPasteboard.general.string = code
-            } label: {
-                Image(systemName: "doc.on.doc").font(.system(size: 12)).foregroundStyle(palette.dim).padding(8)
-            }
-            .accessibilityLabel("Copy code")
-        }
-    }
-}
-
-private struct ToolBlock: View {
-    let item: TranscriptItem
-    let palette: Palette
-
-    private var glyph: (String, Color) {
-        switch item.status {
-        case .running: return ("…", palette.accent)
-        case .ok: return ("✓", palette.success)
-        case .failed: return ("✗", palette.error)
-        case .denied: return ("⊘", palette.dim)
-        case nil: return ("·", palette.dim)
+        .padding(.top, 4)
+        .padding(.bottom, 14)
+        // Fades the transcript out before it reaches the status bar.
+        .background {
+            LinearGradient(
+                stops: [
+                    .init(color: palette.background, location: 0),
+                    .init(color: palette.background.opacity(0.8), location: 0.6),
+                    .init(color: palette.background.opacity(0), location: 1),
+                ],
+                startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea(edges: .top)
+                .allowsHitTesting(false)
         }
     }
 
-    /// Long output is shown from the end, where the result usually is.
-    private var tail: String {
-        let lines = item.text.split(separator: "\n", omittingEmptySubsequences: false)
-        guard lines.count > 40 else { return item.text }
-        return "… \(lines.count - 40) earlier lines\n" + lines.suffix(40).joined(separator: "\n")
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(glyph.0).foregroundStyle(glyph.1)
-                Text(item.title ?? "tool").foregroundStyle(palette.text.opacity(0.85)).textSelection(.enabled)
-            }
-            .font(palette.small)
-            if !item.text.isEmpty {
-                Text(tail).font(palette.small).foregroundStyle(palette.dim).textSelection(.enabled)
-            }
-        }
-        .padding(8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(palette.code, in: RoundedRectangle(cornerRadius: 6))
-    }
-}
-
-// MARK: Input area
-
-private struct BottomBar: View {
-    @Environment(AppModel.self) private var model
-    var inputFocused: FocusState<Bool>.Binding
-
-    var body: some View {
-        @Bindable var model = model
-        let palette = model.palette
-
-        VStack(spacing: 0) {
-            if let approval = model.pendingApproval {
-                ApprovalBar(approval: approval, palette: palette)
-            } else if !model.suggestions.isEmpty {
-                SuggestionList(palette: palette)
-            }
-            Rectangle().fill(palette.dim.opacity(0.3)).frame(height: 1)
-
-            HStack(alignment: .top, spacing: 6) {
-                Text(model.setup == nil ? "❯" : "?").font(palette.bold).foregroundStyle(palette.accent)
-                Group {
-                    if model.inputIsSecret {
-                        SecureField("", text: $model.input, prompt: Text(model.placeholder).foregroundStyle(palette.dim))
-                    } else {
-                        TextField("", text: $model.input, prompt: Text(model.placeholder).foregroundStyle(palette.dim), axis: .vertical)
-                            .lineLimit(1...6)
-                    }
-                }
-                .font(palette.font)
-                .foregroundStyle(palette.text)
-                .tint(palette.accent)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .submitLabel(.send)
-                .focused(inputFocused)
-                .onSubmit(send)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-
-            KeyRow(palette: palette, send: send, hideKeyboard: { inputFocused.wrappedValue = false })
-        }
-        .background(palette.background)
-    }
-
-    private func send() {
-        model.submit()
-        // Submitting drops focus; keep the keyboard up like a terminal would.
-        DispatchQueue.main.async { inputFocused.wrappedValue = true }
-    }
-}
-
-private struct KeyRow: View {
-    @Environment(AppModel.self) private var model
-    let palette: Palette
-    let send: () -> Void
-    let hideKeyboard: () -> Void
-
-    var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                key("esc") { model.escape() }
-                key("/") { model.input += "/" }
-                key("!") { model.input += "!" }
-                key("↑") { model.historyUp() }
-                key("↓") { model.historyDown() }
-                key("tab") { model.completeSuggestion() }
-                key("^C", tint: model.isRunning ? palette.error : nil) { model.cancel() }
-                key("paste") {
-                    if let text = UIPasteboard.general.string { model.input += text }
-                }
-                key("⌄", action: hideKeyboard)
-                key("⏎", tint: palette.accent, action: send)
-            }
-            .padding(.horizontal, 10)
-            .padding(.bottom, 8)
-        }
-    }
-
-    private func key(_ label: String, tint: Color? = nil, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(label)
-                .font(palette.small)
-                .foregroundStyle(tint ?? palette.text)
-                .padding(.horizontal, 11)
-                .frame(minWidth: 38, minHeight: 32)
-                .background(palette.code, in: RoundedRectangle(cornerRadius: 6))
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-private struct SuggestionList: View {
-    @Environment(AppModel.self) private var model
-    let palette: Palette
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(model.suggestions.prefix(6), id: \.name) { command in
-                Button {
-                    model.input = "/\(command.name) "
-                } label: {
-                    HStack(spacing: 10) {
-                        Text("/\(command.name)").foregroundStyle(palette.accent)
-                        Text(command.help).foregroundStyle(palette.dim).lineLimit(1)
-                        Spacer(minLength: 0)
-                    }
-                    .font(palette.small)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 7)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .background(palette.code)
-    }
-}
-
-private struct ApprovalBar: View {
-    @Environment(AppModel.self) private var model
-    let approval: PendingApproval
-    let palette: Palette
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("run this?").font(palette.small).foregroundStyle(palette.accent)
-            Text(approval.summary).font(palette.small).foregroundStyle(palette.text).lineLimit(6)
-            HStack(spacing: 8) {
-                choice("[y] yes", palette.success) { model.resolveApproval(.allow) }
-                choice("[n] no", palette.error) { model.resolveApproval(.deny) }
-                choice("[a] always", palette.dim) { model.allowAlways() }
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(palette.code)
-    }
-
-    private func choice(_ label: String, _ color: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(label).font(palette.small).foregroundStyle(color)
-                .padding(.horizontal, 12)
-                .frame(minHeight: 34)
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(color.opacity(0.6)))
-        }
-        .buttonStyle(.plain)
+    /// The model without its provider prefix; the menu lists the full IDs under each profile.
+    private var modelLabel: String {
+        guard model.activeProfile != nil else { return "no profile · /setup" }
+        guard let id = model.activeModel else { return "no model" }
+        return id.split(separator: "/").last.map(String.init) ?? id
     }
 }
 

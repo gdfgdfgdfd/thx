@@ -29,7 +29,16 @@ First launch: type `/setup` and answer the prompts (profile name, base URL, API 
 | `/new`, `/sessions [n]`, `/retry` | session control |
 | `/copy`, `/export`, `/clear` | copy the last answer, share as Markdown, clear the screen |
 
-The key row above the keyboard has `esc`, `/`, `!`, history `↑ ↓`, `tab` (complete a command), `^C` (stop the current run) and `paste`.
+The key row appears with the keyboard and has `esc`, `/`, `!`, history `↑ ↓`, `tab` (complete a command), `^C` (stop the current run) and `paste`. The round button in the input sends, or stops the run when nothing is typed.
+
+The rest is on screen:
+
+- **Sessions** (stack icon, top left): switch to a saved session, start a new one, swipe to delete.
+- **Files** (paperclip): attach files from the Files app to the next message. They are copied to `uploads/` in the workspace. Text files up to 48 KB are sent with the message; larger ones the agent reads on demand; binary files are only saved.
+- **Edit and resend**: the pencil under your last message, or touch and hold any message. Sending replaces that message and the replies after it. The ↻ under the last answer resends it unchanged.
+- **Tool calls** fold into a list with one line per call; tap a line for its output. Code blocks and tool output have a copy button.
+
+On iOS 26 the bars and the input are Liquid Glass; earlier versions get a blurred card instead.
 
 ## Safety model
 
