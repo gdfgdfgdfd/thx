@@ -95,6 +95,42 @@ public enum Markdown {
         }
     }
 
+    /// Prose as blocks to lay out one under another: consecutive plain lines form a paragraph and
+    /// consecutive quote lines one quote; every heading, list item and rule stands alone. Blank lines only separate.
+    public static func blocks(_ prose: String) -> [Line] {
+        var blocks: [Line] = []
+        var paragraph: [String] = []
+
+        func flush() {
+            guard !paragraph.isEmpty else { return }
+            blocks.append(Line(kind: .text, text: paragraph.joined(separator: "\n")))
+            paragraph = []
+        }
+
+        for line in lines(prose) {
+            switch line.kind {
+            case .text:
+                if line.text.trimmingCharacters(in: .whitespaces).isEmpty {
+                    flush()
+                } else {
+                    paragraph.append(line.text)
+                }
+            case .quote:
+                flush()
+                if let last = blocks.indices.last, blocks[last].kind == .quote {
+                    blocks[last].text += "\n" + line.text
+                } else {
+                    blocks.append(line)
+                }
+            case .heading, .bullet, .numbered, .rule:
+                flush()
+                blocks.append(line)
+            }
+        }
+        flush()
+        return blocks
+    }
+
     public static func export(_ session: Session) -> String {
         var lines = ["# \(session.title)", ""]
         for item in session.transcript {

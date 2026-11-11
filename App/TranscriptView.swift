@@ -8,7 +8,7 @@ private let rowTransition = AnyTransition.asymmetric(
 
 struct TranscriptView: View {
     @Environment(AppModel.self) private var model
-    /// Heights of the bars floating over the transcript.
+    /// Heights of the bars floating over the conversation.
     let topInset: CGFloat
     let bottomInset: CGFloat
 
@@ -20,7 +20,7 @@ struct TranscriptView: View {
         GeometryReader { geometry in
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 12) {
+                    LazyVStack(alignment: .leading, spacing: 14) {
                         ForEach(groups) { group in
                             row(group, palette: palette, lastPromptID: lastPromptID)
                                 .transition(rowTransition)
@@ -28,10 +28,10 @@ struct TranscriptView: View {
                         footer(palette: palette, lastPromptID: lastPromptID)
                         Color.clear.frame(height: 1).id("bottom")
                     }
-                    .padding(.horizontal, 14)
+                    .padding(.horizontal, Metrics.margin)
                     .padding(.top, topInset + 4)
-                    .padding(.bottom, bottomInset + 6)
-                    // A short transcript starts at the top, like a fresh terminal, rather than hugging the input.
+                    .padding(.bottom, bottomInset + 8)
+                    // A short conversation starts at the top rather than hugging the message box.
                     .frame(maxWidth: .infinity, minHeight: geometry.size.height, alignment: .topLeading)
                     .shadow(color: model.theme.glow ? palette.text.opacity(0.55) : .clear, radius: 3)
                     .animation(.snappy(duration: 0.3), value: groups.count)
@@ -44,12 +44,14 @@ struct TranscriptView: View {
                 }
             }
         }
+        // A different session is a different scroll view: it opens at its own latest message.
+        .id(model.session.id)
     }
 
     @ViewBuilder
     private func row(_ group: TranscriptGroup, palette: Palette, lastPromptID: UUID?) -> some View {
         if group.isActivity {
-            ActivityList(items: group.items, palette: palette)
+            ActivityList(group: group, palette: palette)
         } else {
             let item = group.items[0]
             switch item.kind {
@@ -61,14 +63,21 @@ struct TranscriptView: View {
             case .tool:
                 EmptyView()
             case .info:
-                Text(item.text).font(palette.font).foregroundStyle(palette.dim).textSelection(.enabled)
+                Text(item.text)
+                    .font(palette.mono)
+                    .foregroundStyle(palette.dim)
+                    .textSelection(.enabled)
             case .error:
-                Text(item.text).font(palette.font).foregroundStyle(palette.error).textSelection(.enabled)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 12))
+                    Text(item.text).font(palette.mono).textSelection(.enabled)
+                }
+                .foregroundStyle(palette.error)
             }
         }
     }
 
-    /// Run status while the agent works; afterwards the usage line with copy and retry for the last exchange.
+    /// The run status while the agent works; afterwards copy and retry for the last exchange, and what it cost.
     @ViewBuilder
     private func footer(palette: Palette, lastPromptID: UUID?) -> some View {
         if model.isRunning {
@@ -76,22 +85,28 @@ struct TranscriptView: View {
                 WorkingIndicator(since: model.runStartedAt, palette: palette)
                     .transition(.opacity)
             }
-        } else {
-            let answer = model.session.transcript.last.flatMap { $0.kind == .assistant ? $0.text : nil }
-            if model.usageLine != nil || answer != nil || lastPromptID != nil {
-                HStack(spacing: 0) {
-                    if let usage = model.usageLine {
-                        Text(usage).font(palette.small).foregroundStyle(palette.dim)
-                    }
-                    Spacer(minLength: 8)
-                    if let answer {
-                        CopyButton(text: answer, palette: palette)
-                    }
-                    if lastPromptID != nil {
-                        IconButton(systemName: "arrow.clockwise", label: "Retry", palette: palette) { model.retryLast() }
-                    }
+        } else if model.lastAnswer != nil || lastPromptID != nil || model.usageLine != nil {
+            HStack(spacing: 2) {
+                if let answer = model.lastAnswer {
+                    CopyButton(text: answer, palette: palette, iconSize: 17)
+                        .accessibilityIdentifier("copy-answer")
                 }
+                if lastPromptID != nil {
+                    IconButton(systemName: "arrow.clockwise", label: "Retry", palette: palette, iconSize: 17) {
+                        model.retryLast()
+                    }
+                    .accessibilityIdentifier("retry-last")
+                }
+                if let usage = model.usageLine {
+                    Text(usage)
+                        .font(palette.caption)
+                        .foregroundStyle(palette.dim)
+                        .padding(.leading, 8)
+                }
+                Spacer(minLength: 0)
             }
+            // The buttons carry their own padding; pull them back to the text margin.
+            .padding(.leading, -8)
         }
     }
 }
@@ -112,23 +127,23 @@ private struct PromptBubble: View {
         VStack(alignment: .trailing, spacing: 2) {
             VStack(alignment: .leading, spacing: 8) {
                 if !item.text.isEmpty {
-                    Text(item.text).font(palette.font).foregroundStyle(palette.text)
+                    Text(item.text).font(palette.prose).foregroundStyle(palette.text)
                 }
                 if let files = item.attachments, !files.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(files, id: \.self) { path in
                             Label((path as NSString).lastPathComponent, systemImage: "doc")
-                                .font(palette.small)
+                                .font(palette.caption)
                                 .foregroundStyle(palette.dim)
                                 .lineLimit(1)
                         }
                     }
                 }
             }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 16)
             .padding(.vertical, 10)
-            .background(palette.bubble, in: shape)
-            .overlay { shape.stroke(isEditing ? palette.accent : .clear, lineWidth: 1) }
+            .background(palette.surface, in: shape)
+            .overlay { shape.stroke(isEditing ? palette.accent : Color.clear, lineWidth: 1) }
             .contentShape(.contextMenuPreview, shape)
             .contextMenu {
                 Button {
@@ -151,13 +166,14 @@ private struct PromptBubble: View {
             }
 
             if canRewind, isLastPrompt, !model.isRunning, !isEditing {
-                IconButton(systemName: "pencil", label: "Edit and resend", palette: palette) {
+                IconButton(systemName: "pencil", label: "Edit message", palette: palette) {
                     model.beginEditing(item.id)
                 }
+                .accessibilityIdentifier("edit-last-prompt")
             }
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
-        .padding(.leading, 44)
+        .padding(.leading, 48)
     }
 }
 
@@ -168,23 +184,95 @@ private struct ReplyView: View {
     let palette: Palette
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             ForEach(Array(Markdown.segments(text).enumerated()), id: \.offset) { _, segment in
                 if segment.isCode {
                     CodeBlock(code: segment.text, language: segment.language, palette: palette)
                 } else {
-                    Text(RichText.render(segment.text, palette: palette))
-                        .font(palette.font)
-                        .foregroundStyle(palette.text)
-                        .lineSpacing(3)
-                        .textSelection(.enabled)
+                    ProseView(text: segment.text, palette: palette)
                 }
             }
         }
     }
 }
 
-/// A fenced block with its own copy button, so a command or list can be taken in one tap.
+/// Prose laid out block by block, so list items hang under their marker and paragraphs keep their spacing.
+private struct ProseView: View {
+    let text: String
+    let palette: Palette
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            ForEach(Array(Markdown.blocks(text).enumerated()), id: \.offset) { _, block in
+                BlockView(block: block, palette: palette)
+            }
+        }
+    }
+}
+
+private struct BlockView: View {
+    let block: Markdown.Line
+    let palette: Palette
+
+    var body: some View {
+        switch block.kind {
+        case .text:
+            paragraph(palette.text)
+        case .heading:
+            Text(RichText.inline(block.text, palette: palette))
+                .font(palette.heading)
+                .foregroundStyle(palette.text)
+                .textSelection(.enabled)
+                .padding(.top, 4)
+        case .bullet, .numbered:
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(block.marker)
+                    .font(palette.prose)
+                    .foregroundStyle(palette.dim)
+                    .monospacedDigit()
+                paragraph(palette.text)
+            }
+            .padding(.leading, CGFloat(block.indent) * 18 + 2)
+        case .quote:
+            paragraph(palette.dim)
+                .padding(.leading, 12)
+                .overlay(alignment: .leading) {
+                    Rectangle().fill(palette.border).frame(width: 3)
+                }
+        case .rule:
+            Rectangle().fill(palette.border).frame(height: 1).padding(.vertical, 4)
+        }
+    }
+
+    private func paragraph(_ color: Color) -> some View {
+        Text(RichText.inline(block.text, palette: palette))
+            .font(palette.prose)
+            .foregroundStyle(color)
+            .lineSpacing(3)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+enum RichText {
+    /// Inline Markdown: bold, italics, links and code. Code is set in the accent colour and a monospaced face.
+    static func inline(_ text: String, palette: Palette) -> AttributedString {
+        // Most text carries no markup; skipping the parser for it keeps streaming cheap.
+        guard text.contains(where: { "*_`[~".contains($0) }),
+              var parsed = try? AttributedString(
+                markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) else {
+            return AttributedString(text)
+        }
+        let code = parsed.runs.filter { $0.inlinePresentationIntent?.contains(.code) == true }.map(\.range)
+        for range in code {
+            parsed[range].swiftUI.foregroundColor = palette.accent
+            parsed[range].swiftUI.font = palette.monoInline
+        }
+        return parsed
+    }
+}
+
+/// A fenced block with its own copy button, so a command or a list can be taken in one tap.
 private struct CodeBlock: View {
     let code: String
     let language: String?
@@ -193,18 +281,22 @@ private struct CodeBlock: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 0) {
-                Text(language ?? "text").font(palette.small).foregroundStyle(palette.dim)
+                Text(language ?? "text").font(palette.caption).foregroundStyle(palette.dim)
                 Spacer(minLength: 8)
-                CopyButton(text: code, palette: palette, label: "Copy")
+                CopyButton(text: code, palette: palette, label: "Copy", iconSize: 14)
             }
-            .padding(.leading, 12)
-            .padding(.trailing, 4)
-            .background(palette.text.opacity(0.05))
+            .padding(.leading, 14)
+            .padding(.trailing, 6)
+            .padding(.top, 2)
 
             ScrollView(.horizontal, showsIndicators: false) {
-                Text(code).font(palette.font).foregroundStyle(palette.text).textSelection(.enabled)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
+                Text(code)
+                    .font(palette.mono)
+                    .foregroundStyle(palette.text)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 4)
+                    .padding(.bottom, 12)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -212,65 +304,31 @@ private struct CodeBlock: View {
     }
 }
 
-enum RichText {
-    /// Prose with the Markdown the model is told it may use: headings, lists, quotes, bold and inline code.
-    static func render(_ prose: String, palette: Palette) -> AttributedString {
-        var result = AttributedString()
-        for (index, line) in Markdown.lines(prose).enumerated() {
-            if index > 0 { result += AttributedString("\n") }
-            var prefix = String(repeating: "  ", count: line.indent)
-            var body = inline(line.text, palette: palette)
-            switch line.kind {
-            case .text:
-                break
-            case .heading:
-                body.swiftUI.font = palette.bold
-            case .bullet, .numbered:
-                prefix += line.marker + " "
-            case .quote:
-                prefix += "▎ "
-                body.swiftUI.foregroundColor = palette.dim
-            case .rule:
-                body = AttributedString("────────────")
-                body.swiftUI.foregroundColor = palette.dim
-            }
-            if !prefix.isEmpty {
-                var marker = AttributedString(prefix)
-                marker.swiftUI.foregroundColor = palette.dim
-                result += marker
-            }
-            result += body
-        }
-        return result
-    }
-
-    private static func inline(_ text: String, palette: Palette) -> AttributedString {
-        // Most lines carry no markup; skipping the parser for them keeps streaming cheap.
-        guard text.contains(where: { "*_`[~".contains($0) }),
-              var parsed = try? AttributedString(
-                markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) else {
-            return AttributedString(text)
-        }
-        let code = parsed.runs.filter { $0.inlinePresentationIntent?.contains(.code) == true }.map(\.range)
-        for range in code { parsed[range].swiftUI.foregroundColor = palette.accent }
-        return parsed
-    }
-}
-
 // MARK: Tool activity
 
 /// Consecutive tool calls as one compact list: a line per call, output folded away until tapped.
+/// A long list shows its newest steps and folds the rest behind its header.
 private struct ActivityList: View {
     @Environment(AppModel.self) private var model
-    let items: [TranscriptItem]
+    let group: TranscriptGroup
     let palette: Palette
 
+    private static let foldAbove = 5
+    private static let shownWhenFolded = 3
+
     var body: some View {
+        let items = group.items
+        let isLong = items.count > Self.foldAbove
+        let isFolded = isLong && !model.expandedGroups.contains(group.id)
+        let visible = isFolded ? Array(items.suffix(Self.shownWhenFolded)) : items
+
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                if index > 0 {
-                    Rectangle().fill(palette.edge).frame(height: 0.5).padding(.leading, 36)
-                }
+            if isLong {
+                header(items: items, isFolded: isFolded)
+                separator(inset: 0)
+            }
+            ForEach(Array(visible.enumerated()), id: \.element.id) { index, item in
+                if index > 0 { separator(inset: 39) }
                 ToolRow(item: item, palette: palette, isExpanded: model.expandedTools.contains(item.id)) {
                     withAnimation(.snappy(duration: 0.25)) { model.toggleTool(item.id) }
                 }
@@ -278,6 +336,31 @@ private struct ActivityList: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .card(palette)
+    }
+
+    private func separator(inset: CGFloat) -> some View {
+        Rectangle().fill(palette.border).frame(height: 1).padding(.leading, inset)
+    }
+
+    private func header(items: [TranscriptItem], isFolded: Bool) -> some View {
+        let failed = items.filter { $0.status == .failed }.count
+        let summary = "\(items.count) steps" + (failed > 0 ? " · \(failed) failed" : "")
+
+        return Button {
+            withAnimation(.snappy(duration: 0.25)) { model.toggleGroup(group.id) }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "list.bullet").font(.system(size: 13)).foregroundStyle(palette.dim)
+                Text(summary).font(palette.caption).foregroundStyle(palette.dim)
+                Spacer(minLength: 8)
+                Text(isFolded ? "Show all" : "Show less").font(palette.caption).foregroundStyle(palette.accent)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 36)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("tool-group-toggle")
     }
 }
 
@@ -292,16 +375,16 @@ private struct ToolRow: View {
 
         VStack(alignment: .leading, spacing: 0) {
             Button(action: toggle) {
-                HStack(alignment: .top, spacing: 8) {
+                HStack(alignment: .top, spacing: 10) {
                     StatusGlyph(status: item.status, palette: palette)
-                    VStack(alignment: .leading, spacing: 3) {
+                    VStack(alignment: .leading, spacing: 4) {
                         Text(item.title ?? "tool")
-                            .foregroundStyle(palette.text.opacity(0.9))
+                            .foregroundStyle(palette.text)
                             .lineLimit(isExpanded ? nil : 1)
                             .multilineTextAlignment(.leading)
                         if !isExpanded, let preview = Transcript.preview(item.text) {
                             HStack(spacing: 6) {
-                                Text("⎿ \(preview)").lineLimit(1)
+                                Text(preview).lineLimit(1)
                                 if lines > 1 {
                                     Text("+\(lines - 1)").fixedSize()
                                 }
@@ -311,36 +394,38 @@ private struct ToolRow: View {
                     }
                     Spacer(minLength: 4)
                     Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(palette.dim)
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .padding(.top, 3)
                 }
-                .font(palette.small)
+                .font(palette.mono)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("tool-row")
             .accessibilityHint(isExpanded ? "Hides the output" : "Shows the output")
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 2) {
                     if item.text.isEmpty {
-                        Text("no output").font(palette.small).foregroundStyle(palette.dim)
+                        Text("no output").font(palette.mono).foregroundStyle(palette.dim)
                     } else {
                         Text(Transcript.tail(item.text))
-                            .font(palette.small)
+                            .font(palette.mono)
                             .foregroundStyle(palette.dim)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            .accessibilityIdentifier("tool-output")
                         HStack(spacing: 0) {
                             Spacer(minLength: 0)
                             CopyButton(text: item.text, palette: palette, label: "Copy output")
                         }
                     }
                 }
-                .padding(.leading, 36)
+                .padding(.leading, 39)
                 .padding(.trailing, 8)
                 .padding(.bottom, 8)
                 .transition(.opacity)
@@ -357,7 +442,7 @@ private struct StatusGlyph: View {
         Group {
             switch status {
             case .running:
-                ProgressView().controlSize(.small).scaleEffect(0.7).tint(palette.accent)
+                ProgressView().controlSize(.small).tint(palette.accent)
             case .ok:
                 Image(systemName: "checkmark.circle.fill").foregroundStyle(palette.success)
             case .failed:
@@ -368,9 +453,8 @@ private struct StatusGlyph: View {
                 Image(systemName: "circle").foregroundStyle(palette.dim)
             }
         }
-        .font(.system(size: 13))
-        .frame(width: 16, height: 16)
-        .transition(AnyTransition.scale(scale: 0.6).combined(with: .opacity))
+        .font(.system(size: 16))
+        .frame(width: 17, height: 17)
         .animation(.snappy(duration: 0.25), value: status)
     }
 }
@@ -380,36 +464,23 @@ private struct StatusGlyph: View {
 private struct WorkingIndicator: View {
     let since: Date
     let palette: Palette
+    @State private var isSpinning = false
 
     var body: some View {
-        HStack(spacing: 8) {
-            PulsingDots(color: palette.accent)
+        HStack(spacing: 10) {
+            SparkMark(size: 18, color: palette.accent)
+                .rotationEffect(.degrees(isSpinning ? 360 : 0))
+                .animation(.linear(duration: 2.4).repeatForever(autoreverses: false), value: isSpinning)
             TimelineView(.periodic(from: since, by: 1)) { context in
-                Text("working · \(max(0, Int(context.date.timeIntervalSince(since))))s")
-                    .font(palette.small)
+                Text("Working · \(max(0, Int(context.date.timeIntervalSince(since))))s")
+                    .font(palette.caption)
                     .foregroundStyle(palette.dim)
                     .monospacedDigit()
             }
         }
         .padding(.vertical, 4)
+        .onAppear { isSpinning = true }
+        .accessibilityElement(children: .ignore)
         .accessibilityLabel("Working")
-    }
-}
-
-private struct PulsingDots: View {
-    let color: Color
-    @State private var isAnimating = false
-
-    var body: some View {
-        HStack(spacing: 4) {
-            ForEach(0..<3, id: \.self) { index in
-                Circle()
-                    .fill(color)
-                    .frame(width: 5, height: 5)
-                    .opacity(isAnimating ? 1 : 0.25)
-                    .animation(.easeInOut(duration: 0.6).repeatForever().delay(Double(index) * 0.2), value: isAnimating)
-            }
-        }
-        .onAppear { isAnimating = true }
     }
 }

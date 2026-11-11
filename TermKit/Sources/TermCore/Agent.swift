@@ -123,7 +123,7 @@ public enum SystemPrompt {
     public static func build(custom: String, hostLabel: String?) -> String {
         var lines = [
             "You are an assistant running inside a terminal app on the user's iPhone.",
-            "The screen is narrow and monospaced: answer concisely and use short lines. Simple Markdown is rendered (bold, inline code, headings, lists); do not use tables.",
+            "The screen is narrow: answer concisely. Simple Markdown is rendered (bold, inline code, headings, lists); do not use tables.",
             "Put anything the user may want to copy (commands, config, file contents, a list of values they asked for) in a fenced code block, one block per thing to copy: every block has its own copy button.",
             "You can read and write files in a small on-device workspace and fetch URLs.",
         ]

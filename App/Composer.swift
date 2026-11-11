@@ -2,18 +2,18 @@ import SwiftUI
 import TermCore
 import UIKit
 
-/// Panels above and below the input slide up from the bottom edge.
+/// Panels above and below the message box slide up from the bottom edge.
 private let riseTransition = AnyTransition.move(edge: .bottom).combined(with: .opacity)
 
-/// The floating input area: approval or command suggestions on top, then the message field, then the key row.
+/// The floating input area: an approval request or command suggestions on top, the message box, and under it
+/// either the host and permission switches or, while typing, a row of keys the iOS keyboard lacks.
 struct Composer: View {
     @Environment(AppModel.self) private var model
     var inputFocused: FocusState<Bool>.Binding
 
     var body: some View {
-        @Bindable var model = model
         let palette = model.palette
-        let showsKeys = inputFocused.wrappedValue || model.demoShowsKeys
+        let showsKeys = inputFocused.wrappedValue
 
         VStack(spacing: 8) {
             if let approval = model.pendingApproval {
@@ -24,7 +24,7 @@ struct Composer: View {
                     .transition(riseTransition)
             }
 
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
                 if model.editingItemID != nil {
                     EditingBanner(palette: palette)
                         .transition(.opacity)
@@ -33,47 +33,36 @@ struct Composer: View {
                     AttachmentStrip(palette: palette)
                         .transition(.opacity)
                 }
-                HStack(alignment: .bottom, spacing: 6) {
-                    leadingControl(palette: palette)
-                    Group {
-                        if model.inputIsSecret {
-                            SecureField("", text: $model.input, prompt: Text(model.placeholder).foregroundStyle(palette.dim))
-                        } else {
-                            TextField("", text: $model.input, prompt: Text(model.placeholder).foregroundStyle(palette.dim), axis: .vertical)
-                                .lineLimit(1...6)
-                        }
-                    }
-                    .font(palette.font)
-                    .foregroundStyle(palette.text)
-                    .tint(palette.accent)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .submitLabel(.send)
-                    .focused(inputFocused)
-                    .onSubmit(send)
-                    .padding(.vertical, 8)
-
+                InputField(palette: palette, inputFocused: inputFocused, send: send)
+                HStack(spacing: 10) {
+                    PlusMenu(palette: palette)
+                    Spacer(minLength: 0)
+                    ModelButton(palette: palette)
                     SendButton(palette: palette, send: send)
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+            .padding(.horizontal, 12)
+            .padding(.top, 14)
+            .padding(.bottom, 10)
             .glass(in: RoundedRectangle(cornerRadius: Metrics.composerRadius, style: .continuous))
 
             if showsKeys {
                 KeyRow(palette: palette, hideKeyboard: { inputFocused.wrappedValue = false })
-                    .transition(riseTransition)
+                    .transition(.opacity)
+            } else {
+                StatusRow(palette: palette)
+                    .transition(.opacity)
             }
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 12)
         .padding(.top, 14)
-        .padding(.bottom, 8)
-        // Fades the transcript out underneath, so nothing shows through around the home indicator.
+        .padding(.bottom, 6)
+        // Fades the conversation out underneath, so nothing shows through around the home indicator.
         .background {
             LinearGradient(
                 stops: [
                     .init(color: palette.background.opacity(0), location: 0),
-                    .init(color: palette.background.opacity(0.85), location: 0.45),
+                    .init(color: palette.background.opacity(0.85), location: 0.4),
                     .init(color: palette.background, location: 1),
                 ],
                 startPoint: .top, endPoint: .bottom)
@@ -87,36 +76,101 @@ struct Composer: View {
         .animation(.snappy(duration: 0.25), value: showsKeys)
     }
 
-    /// The files button; the setup wizard shows its question mark there instead.
-    @ViewBuilder
-    private func leadingControl(palette: Palette) -> some View {
-        if model.setup != nil {
-            Text("?").font(palette.bold).foregroundStyle(palette.accent)
-                .frame(width: 34, height: 34)
-        } else {
-            Button {
-                model.showFilePicker = true
-            } label: {
-                Image(systemName: "paperclip")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(palette.dim)
-                    .frame(width: 34, height: 34)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(model.pendingApproval != nil)
-            .accessibilityLabel("Attach files")
-        }
-    }
-
     private func send() {
         model.submit()
-        // Submitting drops focus; keep the keyboard up like a terminal would.
+        // Submitting drops focus; keep the keyboard up so the next message can be typed straight away.
         DispatchQueue.main.async { inputFocused.wrappedValue = true }
     }
 }
 
-/// Sends the input, or stops the run when there is nothing typed.
+private struct InputField: View {
+    @Environment(AppModel.self) private var model
+    let palette: Palette
+    var inputFocused: FocusState<Bool>.Binding
+    let send: () -> Void
+
+    var body: some View {
+        @Bindable var model = model
+
+        Group {
+            if model.inputIsSecret {
+                SecureField("", text: $model.input, prompt: Text(model.placeholder).foregroundStyle(palette.dim))
+            } else {
+                TextField("", text: $model.input, prompt: Text(model.placeholder).foregroundStyle(palette.dim), axis: .vertical)
+                    .lineLimit(1...6)
+            }
+        }
+        .font(palette.prose)
+        .foregroundStyle(palette.text)
+        .tint(palette.accent)
+        .textInputAutocapitalization(.never)
+        .autocorrectionDisabled()
+        .submitLabel(.send)
+        .focused(inputFocused)
+        .onSubmit(send)
+        .padding(.horizontal, 6)
+        .accessibilityIdentifier("composer-input")
+    }
+}
+
+/// Adds files to the next message: straight from the device, or from the workspace.
+private struct PlusMenu: View {
+    @Environment(AppModel.self) private var model
+    let palette: Palette
+
+    var body: some View {
+        Menu {
+            Button {
+                model.showImporter = true
+            } label: {
+                Label("Attach files", systemImage: "paperclip")
+            }
+            Button {
+                model.present(.files)
+            } label: {
+                Label("Workspace files", systemImage: "folder")
+            }
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(palette.text)
+                .frame(width: 34, height: 34)
+                .outlined(palette, fill: palette.card)
+        }
+        .disabled(model.setup != nil || model.pendingApproval != nil)
+        .accessibilityLabel("Add files")
+        .accessibilityIdentifier("composer-plus")
+    }
+}
+
+private struct ModelButton: View {
+    @Environment(AppModel.self) private var model
+    let palette: Palette
+
+    var body: some View {
+        Button {
+            model.present(.models)
+        } label: {
+            HStack(spacing: 6) {
+                Text(model.modelLabel)
+                    .font(palette.label)
+                    .foregroundStyle(palette.text)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(palette.dim)
+            }
+            .frame(height: 36)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Model: \(model.modelLabel)")
+        .accessibilityIdentifier("composer-model")
+    }
+}
+
+/// Sends the message, or stops the run when there is nothing typed.
 private struct SendButton: View {
     @Environment(AppModel.self) private var model
     let palette: Palette
@@ -124,7 +178,7 @@ private struct SendButton: View {
 
     var body: some View {
         let hasInput = !model.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let stops = model.isRunning && model.pendingApproval == nil && !hasInput
+        let stops = model.isRunning && !hasInput
         let isEnabled = stops || hasInput || model.setup != nil || !model.pendingAttachments.isEmpty
 
         Button {
@@ -135,17 +189,18 @@ private struct SendButton: View {
             }
         } label: {
             Image(systemName: stops ? "stop.fill" : "arrow.up")
-                .font(.system(size: 15, weight: .bold))
+                .font(.system(size: stops ? 13 : 16, weight: .bold))
                 .contentTransition(.symbolEffect(.replace))
-                .foregroundStyle(palette.background)
-                .frame(width: 34, height: 34)
-                .background(stops ? palette.error : (isEnabled ? palette.accent : palette.dim.opacity(0.45)), in: Circle())
+                .foregroundStyle(isEnabled ? palette.onAccent : palette.dim.opacity(0.7))
+                .frame(width: 36, height: 36)
+                .background(isEnabled ? palette.accent : palette.inactive, in: Circle())
         }
         .buttonStyle(.plain)
         .disabled(!isEnabled)
         .animation(.snappy(duration: 0.2), value: isEnabled)
         .animation(.snappy(duration: 0.2), value: stops)
         .accessibilityLabel(stops ? "Stop" : "Send")
+        .accessibilityIdentifier("composer-send")
     }
 }
 
@@ -156,7 +211,7 @@ private struct EditingBanner: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "pencil").foregroundStyle(palette.accent)
-            Text("editing · sending replaces the message and its replies")
+            Text("Editing · sending replaces the message and the replies after it")
                 .foregroundStyle(palette.dim)
                 .lineLimit(2)
             Spacer(minLength: 4)
@@ -165,15 +220,16 @@ private struct EditingBanner: View {
             } label: {
                 Image(systemName: "xmark")
                     .foregroundStyle(palette.dim)
-                    .frame(width: 28, height: 28)
+                    .frame(width: 30, height: 30)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Cancel editing")
         }
-        .font(palette.small)
-        .padding(.leading, 8)
-        .padding(.top, 2)
+        .font(palette.caption)
+        .padding(.leading, 6)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("editing-banner")
     }
 }
 
@@ -196,23 +252,100 @@ private struct AttachmentStrip: View {
                             Image(systemName: "xmark")
                                 .font(.system(size: 9, weight: .bold))
                                 .foregroundStyle(palette.dim)
-                                .frame(width: 22, height: 26)
+                                .frame(width: 24, height: 28)
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Remove \(attachment.name)")
                     }
-                    .font(palette.small)
+                    .font(palette.caption)
                     .foregroundStyle(palette.text)
                     .padding(.leading, 10)
                     .padding(.trailing, 4)
-                    .frame(height: 30)
-                    .background(palette.bubble, in: Capsule())
+                    .frame(height: 32)
+                    .outlined(palette, fill: palette.card, radius: 16)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("attachment-\(attachment.name)")
                 }
             }
-            .padding(.horizontal, 4)
+            .padding(.horizontal, 2)
+            .padding(.vertical, 1)
         }
-        .padding(.top, 2)
+    }
+}
+
+/// Which SSH host the agent works on, and whether it asks before acting.
+private struct StatusRow: View {
+    @Environment(AppModel.self) private var model
+    let palette: Palette
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Menu {
+                ForEach(model.hosts) { host in
+                    Button {
+                        model.selectHost(host.id)
+                    } label: {
+                        if host.id == model.activeHost?.id {
+                            Label("\(host.name)  \(host.address)", systemImage: "checkmark")
+                        } else {
+                            Text("\(host.name)  \(host.address)")
+                        }
+                    }
+                }
+                Button {
+                    model.selectHost(nil)
+                } label: {
+                    if model.activeHost == nil {
+                        Label("No SSH host", systemImage: "checkmark")
+                    } else {
+                        Text("No SSH host")
+                    }
+                }
+                Divider()
+                Button {
+                    model.openSettings(.host(nil))
+                } label: {
+                    Label("Add host", systemImage: "plus")
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "server.rack").font(.system(size: 14))
+                    Text(model.activeHost?.name ?? "No host").font(palette.label).lineLimit(1)
+                }
+                .foregroundStyle(palette.dim)
+                .frame(height: 32)
+                .contentShape(Rectangle())
+            }
+            .accessibilityLabel("SSH host: \(model.activeHost?.name ?? "none")")
+            .accessibilityIdentifier("composer-host")
+
+            Spacer(minLength: 0)
+
+            Menu {
+                ForEach(ApprovalMode.allCases, id: \.self) { mode in
+                    Button {
+                        model.setApprovalMode(mode)
+                    } label: {
+                        if mode == model.settings.approvalMode {
+                            Label(mode.label, systemImage: "checkmark")
+                        } else {
+                            Text(mode.label)
+                        }
+                    }
+                }
+            } label: {
+                Text(model.settings.approvalMode.label)
+                    .font(palette.label)
+                    .foregroundStyle(palette.dim)
+                    .padding(.horizontal, 12)
+                    .frame(height: 30)
+                    .glass(in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            }
+            .accessibilityLabel("Permissions: \(model.settings.approvalMode.label)")
+            .accessibilityIdentifier("composer-permissions")
+        }
+        .padding(.horizontal, 8)
     }
 }
 
@@ -230,7 +363,6 @@ private struct KeyRow: View {
                 key("↑") { model.historyUp() }
                 key("↓") { model.historyDown() }
                 key("tab") { model.completeSuggestion() }
-                key("^C", tint: model.isRunning ? palette.error : nil) { model.cancel() }
                 key("paste") {
                     if let text = UIPasteboard.general.string { model.input += text }
                 }
@@ -238,18 +370,18 @@ private struct KeyRow: View {
             }
             .padding(.horizontal, 6)
         }
-        .frame(height: Metrics.barHeight)
+        .frame(height: 36)
         .clipShape(Capsule())
         .glass(in: Capsule())
     }
 
-    private func key(_ label: String, tint: Color? = nil, action: @escaping () -> Void) -> some View {
+    private func key(_ label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(label)
-                .font(palette.small)
-                .foregroundStyle(tint ?? palette.text)
-                .padding(.horizontal, 12)
-                .frame(minWidth: 40, minHeight: Metrics.barHeight)
+                .font(palette.mono)
+                .foregroundStyle(palette.text)
+                .padding(.horizontal, 13)
+                .frame(minWidth: 42, minHeight: 36)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -267,19 +399,18 @@ private struct SuggestionList: View {
                     model.input = "/\(command.name) "
                 } label: {
                     HStack(spacing: 10) {
-                        Text("/\(command.name)").foregroundStyle(palette.accent)
-                        Text(command.help).foregroundStyle(palette.dim).lineLimit(1)
+                        Text("/\(command.name)").font(palette.mono).foregroundStyle(palette.accent)
+                        Text(command.help).font(palette.caption).foregroundStyle(palette.dim).lineLimit(1)
                         Spacer(minLength: 0)
                     }
-                    .font(palette.small)
-                    .padding(.horizontal, 14)
+                    .padding(.horizontal, 16)
                     .padding(.vertical, 8)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
         }
-        .padding(.vertical, 6)
+        .padding(.vertical, 8)
         .glass(in: RoundedRectangle(cornerRadius: Metrics.bubbleRadius, style: .continuous))
     }
 }
@@ -290,28 +421,41 @@ private struct ApprovalCard: View {
     let palette: Palette
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("run this?").font(palette.small).foregroundStyle(palette.accent)
-            Text(approval.summary).font(palette.small).foregroundStyle(palette.text).lineLimit(6)
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Allow this action?")
+                .font(palette.labelBold)
+                .foregroundStyle(palette.text)
+            Text(approval.summary)
+                .font(palette.mono)
+                .foregroundStyle(palette.text)
+                .lineLimit(6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(palette.card, in: RoundedRectangle(cornerRadius: Metrics.controlRadius, style: .continuous))
             HStack(spacing: 8) {
-                choice("[y] yes", palette.success) { model.resolveApproval(.allow) }
-                choice("[n] no", palette.error) { model.resolveApproval(.deny) }
-                choice("[a] always", palette.dim) { model.allowAlways() }
+                choice("Deny", "approval-deny", isPrimary: false) { model.resolveApproval(.deny) }
+                choice("Always allow", "approval-always", isPrimary: false) { model.allowAlways() }
+                choice("Allow", "approval-allow", isPrimary: true) { model.resolveApproval(.allow) }
             }
         }
         .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
         .glass(in: RoundedRectangle(cornerRadius: Metrics.bubbleRadius, style: .continuous))
     }
 
-    private func choice(_ label: String, _ color: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(label).font(palette.small).foregroundStyle(color)
-                .padding(.horizontal, 14)
-                .frame(minHeight: 36)
-                .background(color.opacity(0.14), in: Capsule())
-                .overlay { Capsule().stroke(color.opacity(0.5), lineWidth: 0.5) }
+    private func choice(_ label: String, _ identifier: String, isPrimary: Bool, action: @escaping () -> Void) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 11, style: .continuous)
+        return Button(action: action) {
+            Text(label)
+                .font(palette.labelBold)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .foregroundStyle(isPrimary ? palette.onAccent : palette.text)
+                .frame(maxWidth: .infinity)
+                .frame(height: 40)
+                .background(isPrimary ? palette.accent : palette.card, in: shape)
+                .overlay { shape.stroke(isPrimary ? Color.clear : palette.border, lineWidth: 1) }
         }
         .buttonStyle(.plain)
+        .accessibilityIdentifier(identifier)
     }
 }

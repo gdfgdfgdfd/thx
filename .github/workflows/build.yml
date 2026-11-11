@@ -23,7 +23,7 @@ jobs:
   ipa:
     # Intel image: the arm64 macOS pool was leaving jobs queued until they timed out.
     runs-on: macos-15-intel
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       BUNDLE_ID: io.github.hgfh34bnvcn.termai
     steps:
@@ -35,9 +35,6 @@ jobs:
           XCODE=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)
           sudo xcode-select -s "$XCODE/Contents/Developer"
           xcodebuild -version && swift --version
-
-      - name: Core tests
-        run: swift test --package-path TermKit
 
       - name: Generate Xcode project
         run: |
@@ -62,15 +59,18 @@ jobs:
           path: out/TermAI-unsigned.ipa
           if-no-files-found: error
 
-      # Launches the app in demo mode on a simulator so the UI can be reviewed without a device.
-      - name: Simulator screenshots
+      - name: Core tests
+        run: swift test --package-path TermKit
+
+      - name: Build for the simulator
         run: |
           UDID=$(xcrun simctl list devices available -j | python3 -c "
           import json, sys
           runtimes = json.load(sys.stdin)['devices']
           print(next(d['udid'] for key in sorted(runtimes, reverse=True) if 'iOS' in key
                      for d in runtimes[key] if d['name'].startswith('iPhone')))")
-          xcodebuild build -quiet \
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcodebuild build-for-testing -quiet \
             -project TermAI.xcodeproj -scheme TermAI -configuration Debug \
             -sdk iphonesimulator -destination "id=$UDID" \
             -derivedDataPath build/sim \
@@ -78,6 +78,10 @@ jobs:
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
           xcrun simctl install "$UDID" build/sim/Build/Products/Debug-iphonesimulator/TermAI.app
+
+      # Launches the app in demo mode on a simulator so the UI can be reviewed without a device.
+      - name: Simulator screenshots
+        run: |
           mkdir -p shots
           shoot() {
             name=$1; shift
@@ -94,14 +98,30 @@ jobs:
           xcrun simctl terminate "$UDID" "$BUNDLE_ID"
           sleep 3
           for theme in dark crt-green crt-amber light; do shoot "$theme" -theme "$theme"; done
-          shoot approval -demoApproval
-          shoot settings -demoSettings
-          shoot sessions -demoSessions
-          shoot compose -demoCompose
+          for screen in Approval Empty Sidebar Files Terminal Models Settings Connection Host Search Compose Steps; do
+            shoot "$(echo "$screen" | tr '[:upper:]' '[:lower:]')" "-demo$screen"
+          done
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: screenshots
           path: shots
+          if-no-files-found: warn
+
+      # Taps through the app in demo mode: sessions, files, a full agent run with approvals, the terminal, settings.
+      - name: UI tests
+        run: |
+          xcodebuild test-without-building \
+            -project TermAI.xcodeproj -scheme TermAI \
+            -destination "id=$UDID" \
+            -derivedDataPath build/sim \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee uitests.log \
+            | grep -E "^Test (Case|Suite)|error:|Executed [0-9]+ tests|\*\* TEST"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-test-log
+          path: uitests.log
           if-no-files-found: warn
