@@ -23,14 +23,18 @@ jobs:
   ipa:
     # Intel image: the arm64 macOS pool was leaving jobs queued until they timed out.
     runs-on: macos-15-intel
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       BUNDLE_ID: io.github.hgfh34bnvcn.termai
     steps:
       - uses: actions/checkout@v4
 
       - name: Toolchain
-        run: xcodebuild -version && swift --version
+        run: |
+          # Liquid Glass needs the iOS 26 SDK, so build with the newest Xcode on the image rather than its default.
+          XCODE=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version && swift --version
 
       - name: Core tests
         run: swift test --package-path TermKit
@@ -78,7 +82,8 @@ jobs:
           shoot() {
             name=$1; shift
             xcrun simctl launch "$UDID" "$BUNDLE_ID" -demo "$@"
-            sleep 15
+            # Long enough for the slow Intel simulator to get past the launch screen.
+            sleep 25
             xcrun simctl io "$UDID" screenshot "shots/$name.png"
             xcrun simctl terminate "$UDID" "$BUNDLE_ID"
             sleep 3
@@ -91,6 +96,8 @@ jobs:
           for theme in dark crt-green crt-amber light; do shoot "$theme" -theme "$theme"; done
           shoot approval -demoApproval
           shoot settings -demoSettings
+          shoot sessions -demoSessions
+          shoot compose -demoCompose
 
       - uses: actions/upload-artifact@v4
         if: always()

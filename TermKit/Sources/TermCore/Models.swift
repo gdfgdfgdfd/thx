@@ -113,13 +113,20 @@ public struct TranscriptItem: Codable, Identifiable, Equatable, Sendable {
     /// Tool blocks only: the one-line description, e.g. `ssh web1 $ uptime`.
     public var title: String?
     public var status: Status?
+    /// Prompt blocks only: where the prompt sits in `Session.messages`, so it can be edited and resent.
+    public var messageIndex: Int?
+    /// Prompt blocks only: workspace-relative paths of the files attached to it.
+    public var attachments: [String]?
 
-    public init(id: UUID = UUID(), kind: Kind, text: String, title: String? = nil, status: Status? = nil) {
+    public init(id: UUID = UUID(), kind: Kind, text: String, title: String? = nil, status: Status? = nil,
+                messageIndex: Int? = nil, attachments: [String]? = nil) {
         self.id = id
         self.kind = kind
         self.text = text
         self.title = title
         self.status = status
+        self.messageIndex = messageIndex
+        self.attachments = attachments
     }
 }
 

@@ -54,10 +54,22 @@ final class AppModel {
     var pendingApproval: PendingApproval?
     var setup: SetupStep?
     var showSettings = false
+    var showSessions = false
+    var showFilePicker = false
     var shareItem: ShareItem?
     var usageLine: String?
     /// Bumped when the transcript should jump to the bottom.
     var scrollTick = 0
+    var sessionList: [SessionSummary] = []
+    /// Files picked for the next prompt.
+    var pendingAttachments: [Attachment] = []
+    /// The sent prompt being edited: sending replaces it and everything after it.
+    var editingItemID: UUID?
+    /// Tool blocks whose output is unfolded.
+    var expandedTools: Set<UUID> = []
+    var runStartedAt = Date()
+    /// Screenshot mode only: show the key row without the keyboard.
+    var demoShowsKeys = false
 
     @ObservationIgnored let storage: Storage
     @ObservationIgnored let secrets: SecretStore
@@ -71,7 +83,6 @@ final class AppModel {
     @ObservationIgnored private var toolItems: [String: UUID] = [:]
     @ObservationIgnored private var promptHistory: [String] = []
     @ObservationIgnored private var historyIndex: Int?
-    @ObservationIgnored private var runStart = Date()
     @ObservationIgnored private var listedSessions: [SessionSummary] = []
 
     init() {
@@ -100,6 +111,8 @@ final class AppModel {
         if isDemo {
             loadDemo(withApproval: arguments.contains("-demoApproval"))
             showSettings = arguments.contains("-demoSettings")
+            if arguments.contains("-demoSessions") { loadDemoSessions() }
+            if arguments.contains("-demoCompose") { loadDemoCompose() }
         } else if profiles.isEmpty {
             info("TermAI\nno API profile yet. type /setup to add one, or /config for the settings screen.")
         } else {
@@ -146,8 +159,10 @@ final class AppModel {
 
     @discardableResult
     private func append(_ kind: TranscriptItem.Kind, _ text: String, title: String? = nil,
-                        status: TranscriptItem.Status? = nil) -> UUID {
-        let item = TranscriptItem(kind: kind, text: text, title: title, status: status)
+                        status: TranscriptItem.Status? = nil, messageIndex: Int? = nil,
+                        attachments: [String]? = nil) -> UUID {
+        let item = TranscriptItem(kind: kind, text: text, title: title, status: status,
+                                  messageIndex: messageIndex, attachments: attachments)
         session.transcript.append(item)
         return item.id
     }
@@ -194,7 +209,9 @@ final class AppModel {
         let parsed = Commands.parse(raw)
         if parsed != .empty, promptHistory.last != trimmed { promptHistory.append(trimmed) }
         switch parsed {
-        case .empty: break
+        case .empty:
+            // Files alone are a valid prompt.
+            if !pendingAttachments.isEmpty { send("") }
         case .prompt(let text): send(text)
         case .shell(let command): runShell(command)
         case .command(let name, let args):
@@ -230,6 +247,10 @@ final class AppModel {
             setup = nil
             info("setup cancelled")
         }
+        if editingItemID != nil {
+            editingItemID = nil
+            pendingAttachments = []
+        }
         input = ""
         historyIndex = nil
     }
@@ -237,19 +258,29 @@ final class AppModel {
     // MARK: Agent runs
 
     private func send(_ text: String) {
-        guard !isRunning else { return info("busy. ^C stops the current run") }
+        guard !isRunning else {
+            input = text
+            return info("busy. ^C stops the current run")
+        }
         guard let profile = activeProfile else { return fail("no API profile. run /setup") }
         guard let model = activeModel else { return fail("no model selected. use /model <id>") }
-        append(.user, text)
-        if session.messages.isEmpty { session.title = String(text.prefix(48)) }
-        session.messages.append(ChatMessage(role: .user, content: text))
+        if let id = editingItemID { rewind(to: id) }
+        editingItemID = nil
+        let attachments = pendingAttachments
+        pendingAttachments = []
+        if session.messages.isEmpty {
+            session.title = String((text.isEmpty ? attachments.first?.name ?? "files" : text).prefix(48))
+        }
+        session.messages.append(ChatMessage(role: .user, content: Attachments.prompt(text, attachments: attachments)))
+        append(.user, text, messageIndex: session.messages.count - 1,
+               attachments: attachments.isEmpty ? nil : attachments.map(\.path))
         startRun(profile: profile, model: model)
     }
 
     private func startRun(profile: Profile, model: String) {
         isRunning = true
         usageLine = nil
-        runStart = Date()
+        runStartedAt = Date()
         assistantItemID = nil
         let apiKey = secrets.secret(for: profile.secretKey) ?? ""
         if profile.baseURL.lowercased().hasPrefix("http://"), !apiKey.isEmpty {
@@ -328,7 +359,7 @@ final class AppModel {
                 }
             }
         case .usage(let input, let output):
-            let seconds = Int(Date().timeIntervalSince(runStart).rounded())
+            let seconds = Int(Date().timeIntervalSince(runStartedAt).rounded())
             usageLine = "\(Self.compact(input)) in · \(Self.compact(output)) out · \(seconds)s"
         }
     }
@@ -341,6 +372,94 @@ final class AppModel {
         guard isRunning else { return }
         runTask?.cancel()
         if pendingApproval != nil { resolveApproval(.deny) }
+    }
+
+    // MARK: Edit and resend
+
+    /// Whether a prompt block still maps onto the model history, so it can be edited or resent.
+    func canRewind(_ item: TranscriptItem) -> Bool {
+        guard item.kind == .user, let index = item.messageIndex, session.messages.indices.contains(index) else { return false }
+        return session.messages[index].role == .user
+    }
+
+    var lastPromptID: UUID? {
+        session.transcript.last { canRewind($0) }?.id
+    }
+
+    /// Puts a sent prompt back in the input. Sending it replaces that prompt and everything after it.
+    func beginEditing(_ id: UUID) {
+        guard let item = session.transcript.first(where: { $0.id == id }), canRewind(item) else { return }
+        editingItemID = id
+        input = item.text
+        pendingAttachments = reloadAttachments(of: item)
+        historyIndex = nil
+    }
+
+    func cancelEditing() {
+        guard editingItemID != nil else { return }
+        editingItemID = nil
+        pendingAttachments = []
+        input = ""
+    }
+
+    /// Sends a prompt again, dropping the replies it got the first time.
+    func resend(_ id: UUID) {
+        guard !isRunning else { return info("busy. ^C stops the current run") }
+        guard let item = session.transcript.first(where: { $0.id == id }), canRewind(item) else { return fail("nothing to retry") }
+        guard activeProfile != nil, activeModel != nil else { return fail("no profile or model selected") }
+        editingItemID = id
+        pendingAttachments = reloadAttachments(of: item)
+        scrollTick += 1
+        send(item.text)
+    }
+
+    func retryLast() {
+        guard let id = lastPromptID else { return fail("nothing to retry") }
+        resend(id)
+    }
+
+    private func reloadAttachments(of item: TranscriptItem) -> [Attachment] {
+        (item.attachments ?? []).compactMap { try? Attachments.load($0, in: workspace) }
+    }
+
+    /// Drops a prompt and everything after it from the transcript and from the model history.
+    private func rewind(to id: UUID) {
+        guard let position = session.transcript.firstIndex(where: { $0.id == id }),
+              canRewind(session.transcript[position]),
+              let index = session.transcript[position].messageIndex else { return }
+        session.transcript.removeSubrange(position...)
+        session.messages.removeSubrange(index...)
+    }
+
+    // MARK: Attachments
+
+    func attach(_ urls: [URL]) {
+        let workspace = self.workspace
+        Task { [weak self] in
+            // Copying can be slow for large or iCloud files; keep it off the main thread.
+            let results = await Task.detached {
+                urls.map { url -> Result<Attachment, Error> in Result { try importPickedFile(url, into: workspace) } }
+            }.value
+            guard let self else { return }
+            for (url, result) in zip(urls, results) {
+                switch result {
+                case .success(let attachment): self.pendingAttachments.append(attachment)
+                case .failure(let error): self.fail("could not attach \(url.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func removeAttachment(_ id: UUID) {
+        pendingAttachments.removeAll { $0.id == id }
+    }
+
+    func toggleTool(_ id: UUID) {
+        if expandedTools.contains(id) {
+            expandedTools.remove(id)
+        } else {
+            expandedTools.insert(id)
+        }
     }
 
     // MARK: Approval
@@ -404,6 +523,7 @@ final class AppModel {
             return fail("no SSH host selected. add one in /config, then pick it with /host <name>")
         }
         isRunning = true
+        runStartedAt = Date()
         runTask = Task { [weak self] in
             guard let self else { return }
             var itemID: UUID?
@@ -494,6 +614,8 @@ final class AppModel {
             startNewSession()
         case "sessions": sessionsCommand(args)
         case "retry":
+            if let id = lastPromptID { return resend(id) }
+            // Sessions saved before prompts were linked to the history: rerun without trimming the screen.
             guard let index = session.messages.lastIndex(where: { $0.role == .user }) else { return fail("nothing to retry") }
             guard let profile = activeProfile, let model = activeModel else { return fail("no profile or model selected") }
             session.messages.removeSubrange((index + 1)...)
@@ -507,6 +629,7 @@ final class AppModel {
             shareItem = ShareItem(text: Markdown.export(session))
         case "clear":
             session.transcript.removeAll()
+            editingItemID = nil
         default:
             fail("unknown command: /\(name)")
         }
@@ -515,9 +638,53 @@ final class AppModel {
     private func startNewSession() {
         storage.saveSession(session)
         session = Session()
+        resetSessionState()
+        info("new session")
+    }
+
+    private func resetSessionState() {
         alwaysAllow = false
         usageLine = nil
-        info("new session")
+        editingItemID = nil
+        pendingAttachments = []
+        expandedTools = []
+    }
+
+    // MARK: Session switcher
+
+    func openSessions() {
+        storage.saveSession(session)
+        sessionList = storage.sessionSummaries()
+        showSessions = true
+    }
+
+    func newSession() {
+        showSessions = false
+        guard !isRunning else { return info("busy. ^C stops the current run") }
+        startNewSession()
+    }
+
+    func switchSession(_ id: UUID) {
+        showSessions = false
+        guard id != session.id else { return }
+        guard !isRunning else { return info("busy. ^C stops the current run") }
+        guard let loaded = storage.loadSession(id: id) else { return fail("that session could not be opened") }
+        storage.saveSession(session)
+        session = loaded
+        resetSessionState()
+        scrollTick += 1
+    }
+
+    func deleteSession(_ id: UUID) {
+        let isCurrent = id == session.id
+        guard !(isCurrent && isRunning) else { return }
+        storage.deleteSession(id: id)
+        sessionList.removeAll { $0.id == id }
+        if isCurrent {
+            session = Session()
+            resetSessionState()
+            info("new session")
+        }
     }
 
     private func modelCommand(_ args: String) {
@@ -600,8 +767,7 @@ final class AppModel {
         }
         storage.saveSession(session)
         session = loaded
-        alwaysAllow = false
-        usageLine = nil
+        resetSessionState()
         info("resumed: \(loaded.title)")
     }
 
@@ -732,13 +898,16 @@ final class AppModel {
         hosts = [host]
         settings = AppSettings(activeProfileID: profile.id, activeModel: profile.defaultModel, activeHostID: host.id,
                                themeID: UserDefaults.standard.string(forKey: "theme") ?? Theme.minimalDark.id)
-        session = Session(title: "demo", messages: [ChatMessage(role: .user, content: "demo")])
+        session = Session(title: "why is nginx down on web1?",
+                          messages: [ChatMessage(role: .user, content: "why is nginx down on web1?")])
         append(.info, "TermAI · /help for commands")
-        append(.user, "why is nginx down on web1?")
+        append(.user, "why is nginx down on web1?", messageIndex: 0)
         append(.assistant, "Checking the service state first.")
         append(.tool, "× nginx.service - A high performance web server\n     Active: failed (Result: exit-code)\nnginx: [emerg] unknown directive \"servr_name\"\n  in /etc/nginx/sites-enabled/app:4\n[exit 3]",
                title: "ssh web1 $ systemctl status nginx --no-pager", status: .failed)
-        append(.assistant, "There is a typo in the site config, line 4:\n\n```nginx\nservr_name example.com;\n```\n\nIt should be `server_name`. I can fix it and reload:")
+        append(.tool, "server {\n    listen 80;\n    listen [::]:80;\n    servr_name example.com;\n    root /var/www/app;\n}",
+               title: "ssh web1 $ cat /etc/nginx/sites-enabled/app", status: .ok)
+        append(.assistant, "There is a typo in the site config, **line 4**:\n\n```nginx\nservr_name example.com;\n```\n\nIt should be `server_name`. I can fix it and reload:")
         if withApproval {
             append(.tool, "", title: "ssh web1 $ sudo sed -i 's/servr_name/server_name/' /etc/nginx/sites-enabled/app && sudo nginx -t && sudo systemctl reload nginx", status: .running)
             isRunning = true
@@ -750,4 +919,39 @@ final class AppModel {
             usageLine = "2.4k in · 312 out · 9s"
         }
     }
+
+    private func loadDemoSessions() {
+        let titles = ["rotate the TLS cert on web2", "disk usage report for db1", "draft a backup cron job"]
+        for (offset, title) in titles.enumerated() {
+            storage.saveSession(Session(title: title, updatedAt: Date().addingTimeInterval(-3_600 * Double(offset * 9 + 2)),
+                                        messages: [ChatMessage(role: .user, content: title)]))
+        }
+        openSessions()
+    }
+
+    private func loadDemoCompose() {
+        editingItemID = lastPromptID
+        input = "why is nginx down on web1? check the error log too"
+        pendingAttachments = [
+            Attachment(name: "nginx.conf", path: "uploads/nginx.conf", size: 2_140),
+            Attachment(name: "error.log", path: "uploads/error.log", size: 18_400),
+        ]
+        demoShowsKeys = true
+    }
+}
+
+/// Copies a file chosen in the picker into the workspace. Picked URLs are security-scoped and may be
+/// iCloud placeholders, so the scope is opened and the read goes through a file coordinator.
+private func importPickedFile(_ url: URL, into workspace: URL) throws -> Attachment {
+    let scoped = url.startAccessingSecurityScopedResource()
+    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+
+    var coordinationError: NSError?
+    var outcome: Result<Attachment, Error>?
+    NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { readable in
+        outcome = Result { try Attachments.importFile(at: readable, into: workspace) }
+    }
+    if let coordinationError { throw coordinationError }
+    guard let outcome else { throw Failure(message: "the file could not be read") }
+    return try outcome.get()
 }
