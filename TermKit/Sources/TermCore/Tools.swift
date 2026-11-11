@@ -108,15 +108,7 @@ public struct ToolBox: ToolRunning {
 
     /// Resolves a model-supplied path, refusing anything that escapes the workspace.
     func resolve(_ path: String) throws -> URL {
-        let root = workspace.standardizedFileURL.resolvingSymlinksInPath()
-        var relative = path.trimmingCharacters(in: .whitespaces)
-        while relative.hasPrefix("/") { relative.removeFirst() }
-        let target = relative.isEmpty || relative == "." ? root
-            : root.appendingPathComponent(relative).standardizedFileURL.resolvingSymlinksInPath()
-        guard target.path == root.path || target.path.hasPrefix(root.path + "/") else {
-            throw ToolError(message: "path is outside the workspace: \(path)")
-        }
-        return target
+        try WorkspaceFiles(root: workspace).resolve(path)
     }
 
     private func require(_ call: ToolCall, _ key: String) throws -> String {

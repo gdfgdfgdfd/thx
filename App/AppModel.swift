@@ -15,6 +15,28 @@ struct ShareItem: Identifiable {
     let text: String
 }
 
+/// The sheets the main screen presents, one at a time.
+enum AppSheet: String, Identifiable {
+    case settings, files, terminal, models, search
+
+    var id: String { rawValue }
+}
+
+/// A page pushed inside the settings sheet.
+enum SettingsRoute: Hashable {
+    /// `nil` adds a new connection.
+    case connection(UUID?)
+    /// `nil` adds a new host.
+    case host(UUID?)
+    case systemPrompt
+}
+
+/// What came of copying picked files into the workspace.
+struct ImportResult {
+    var paths: [String] = []
+    var failures: [String] = []
+}
+
 /// The `/setup` wizard: each step consumes one line of input.
 enum SetupStep {
     case name
@@ -24,10 +46,10 @@ enum SetupStep {
 
     var placeholder: String {
         switch self {
-        case .name: return "profile name"
-        case .baseURL: return "base url"
-        case .apiKey: return "api key (hidden)"
-        case .model: return "model id"
+        case .name: return "Connection name"
+        case .baseURL: return "Base URL"
+        case .apiKey: return "API key (hidden)"
+        case .model: return "Model ID"
         }
     }
 
@@ -53,64 +75,93 @@ final class AppModel {
     var isRunning = false
     var pendingApproval: PendingApproval?
     var setup: SetupStep?
-    var showSettings = false
-    var shareItem: ShareItem?
     var usageLine: String?
     /// Bumped when the transcript should jump to the bottom.
     var scrollTick = 0
+    /// Bumped when the message box should take the keyboard.
+    var focusRequests = 0
+    var runStartedAt = Date()
+
+    var activeSheet: AppSheet?
+    var settingsPath: [SettingsRoute] = []
+    var showSidebar = false
+    /// The system file picker opened from the message box.
+    var showImporter = false
+    var shareItem: ShareItem?
+
+    /// Saved sessions, most recent first.
+    var sessionList: [SessionSummary] = []
+    /// Files picked for the next prompt.
+    var pendingAttachments: [Attachment] = []
+    /// The sent prompt being edited: sending replaces it and everything after it.
+    var editingItemID: UUID?
+    /// Tool steps whose output is unfolded.
+    var expandedTools: Set<UUID> = []
+    /// Long tool lists unfolded to show every step.
+    var expandedGroups: Set<UUID> = []
+
+    /// The terminal screen. It shares the SSH connection with the agent, but not the conversation.
+    var console = ConsoleLog()
+    var consoleInput = ""
+    var consoleRunning = false
 
     @ObservationIgnored let storage: Storage
     @ObservationIgnored let secrets: SecretStore
     @ObservationIgnored let workspace: URL
+    /// Sample content and a scripted model, for screenshots and UI tests. Nothing touches real storage or the network.
+    @ObservationIgnored let isDemo: Bool
+    @ObservationIgnored private let client: ChatStreaming
+    @ObservationIgnored private let demoShell: RemoteShell?
+    @ObservationIgnored private var demoShellAnnounced = false
     @ObservationIgnored private var runTask: Task<Void, Never>?
+    @ObservationIgnored private var consoleTask: Task<Void, Never>?
     @ObservationIgnored private var approvalContinuation: CheckedContinuation<ApprovalDecision, Never>?
     @ObservationIgnored private var alwaysAllow = false
     @ObservationIgnored private var connection: SSHConnection?
     @ObservationIgnored private var connectionHostID: UUID?
+    @ObservationIgnored private var pendingConnect: (hostID: UUID, task: Task<SSHConnection, Error>)?
     @ObservationIgnored private var assistantItemID: UUID?
     @ObservationIgnored private var toolItems: [String: UUID] = [:]
     @ObservationIgnored private var promptHistory: [String] = []
     @ObservationIgnored private var historyIndex: Int?
-    @ObservationIgnored private var runStart = Date()
     @ObservationIgnored private var listedSessions: [SessionSummary] = []
 
     init() {
         let files = FileManager.default
         let arguments = ProcessInfo.processInfo.arguments
-        let isDemo = arguments.contains("-demo")
+        let demo = arguments.contains("-demo")
         let support: URL
-        if isDemo {
-            // Screenshot mode: sample content, nothing read from or written to real storage.
+        if demo {
             let scratch = files.temporaryDirectory.appendingPathComponent("termai-demo-\(UUID().uuidString)")
             support = scratch.appendingPathComponent("support")
             workspace = scratch.appendingPathComponent("workspace")
             secrets = InMemorySecretStore()
+            client = DemoClient()
+            demoShell = DemoShell()
         } else {
             support = files.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("TermAI")
             workspace = files.urls(for: .documentDirectory, in: .userDomainMask)[0]
             secrets = KeychainStore()
+            client = OpenAIClient()
+            demoShell = nil
         }
+        isDemo = demo
         try? files.createDirectory(at: support, withIntermediateDirectories: true)
         try? files.createDirectory(at: workspace, withIntermediateDirectories: true)
         storage = Storage(directory: support)
         profiles = storage.loadProfiles()
         hosts = storage.loadHosts()
         settings = storage.loadSettings()
+        sessionList = storage.sessionSummaries()
 
-        if isDemo {
-            loadDemo(withApproval: arguments.contains("-demoApproval"))
-            showSettings = arguments.contains("-demoSettings")
-        } else if profiles.isEmpty {
-            info("TermAI\nno API profile yet. type /setup to add one, or /config for the settings screen.")
-        } else {
-            info("TermAI · /help for commands")
-        }
+        if demo { loadDemo(arguments) }
     }
 
     // MARK: Derived state
 
     var theme: Theme { Theme.named(settings.themeID) }
     var palette: Palette { Palette(theme: theme, fontSize: settings.fontSize) }
+    var files: WorkspaceFiles { WorkspaceFiles(root: workspace) }
 
     var activeProfile: Profile? {
         profiles.first { $0.id == settings.activeProfileID } ?? profiles.first
@@ -119,6 +170,13 @@ final class AppModel {
     var activeModel: String? {
         if let model = settings.activeModel, !model.isEmpty { return model }
         return activeProfile?.preferredModel
+    }
+
+    /// The active model without its provider prefix, as shown in the message box.
+    var modelLabel: String {
+        guard activeProfile != nil else { return "No connection" }
+        guard let id = activeModel, !id.isEmpty else { return "No model" }
+        return id.split(separator: "/").last.map(String.init) ?? id
     }
 
     var activeHost: SSHHost? {
@@ -133,8 +191,8 @@ final class AppModel {
 
     var placeholder: String {
         if let setup { return setup.placeholder }
-        if pendingApproval != nil { return "y / n / a" }
-        return isRunning ? "running… ^C to stop" : "message, /command or !shell"
+        if pendingApproval != nil { return "Waiting for your approval" }
+        return isRunning ? "Working… stop to send something else" : "Describe a task or type / for commands"
     }
 
     func update(_ change: (inout AppSettings) -> Void) {
@@ -142,12 +200,44 @@ final class AppModel {
         storage.saveSettings(settings)
     }
 
+    func setApprovalMode(_ mode: ApprovalMode) {
+        update { $0.approvalMode = mode }
+        // Going back to asking also ends an "always allow" given earlier in the session.
+        if mode == .ask { alwaysAllow = false }
+    }
+
+    // MARK: Navigation
+
+    func openSidebar() {
+        refreshSessions()
+        withAnimation(.snappy(duration: 0.3)) { showSidebar = true }
+    }
+
+    func closeSidebar() {
+        withAnimation(.snappy(duration: 0.3)) { showSidebar = false }
+    }
+
+    func present(_ sheet: AppSheet) {
+        closeSidebar()
+        if sheet == .settings { settingsPath = [] }
+        activeSheet = sheet
+    }
+
+    /// Opens settings, optionally straight on one of its pages.
+    func openSettings(_ route: SettingsRoute? = nil) {
+        closeSidebar()
+        settingsPath = route.map { [$0] } ?? []
+        activeSheet = .settings
+    }
+
     // MARK: Transcript
 
     @discardableResult
     private func append(_ kind: TranscriptItem.Kind, _ text: String, title: String? = nil,
-                        status: TranscriptItem.Status? = nil) -> UUID {
-        let item = TranscriptItem(kind: kind, text: text, title: title, status: status)
+                        status: TranscriptItem.Status? = nil, messageIndex: Int? = nil,
+                        attachments: [String]? = nil) -> UUID {
+        let item = TranscriptItem(kind: kind, text: text, title: title, status: status,
+                                  messageIndex: messageIndex, attachments: attachments)
         session.transcript.append(item)
         return item.id
     }
@@ -165,6 +255,28 @@ final class AppModel {
             item.text += chunk
             // Only the tail is shown; keep the stored text bounded for long-running commands.
             if item.text.count > 24_000 { item.text = String(item.text.suffix(16_000)) }
+        }
+    }
+
+    /// The answer the copy button under the transcript copies: the last block, when it is a reply.
+    var lastAnswer: String? {
+        guard let last = session.transcript.last, last.kind == .assistant else { return nil }
+        return last.text
+    }
+
+    func toggleTool(_ id: UUID) {
+        if expandedTools.contains(id) {
+            expandedTools.remove(id)
+        } else {
+            expandedTools.insert(id)
+        }
+    }
+
+    func toggleGroup(_ id: UUID) {
+        if expandedGroups.contains(id) {
+            expandedGroups.remove(id)
+        } else {
+            expandedGroups.insert(id)
         }
     }
 
@@ -194,7 +306,9 @@ final class AppModel {
         let parsed = Commands.parse(raw)
         if parsed != .empty, promptHistory.last != trimmed { promptHistory.append(trimmed) }
         switch parsed {
-        case .empty: break
+        case .empty:
+            // Files alone are a valid prompt.
+            if !pendingAttachments.isEmpty { send("") }
         case .prompt(let text): send(text)
         case .shell(let command): runShell(command)
         case .command(let name, let args):
@@ -230,6 +344,10 @@ final class AppModel {
             setup = nil
             info("setup cancelled")
         }
+        if editingItemID != nil {
+            editingItemID = nil
+            pendingAttachments = []
+        }
         input = ""
         historyIndex = nil
     }
@@ -237,34 +355,55 @@ final class AppModel {
     // MARK: Agent runs
 
     private func send(_ text: String) {
-        guard !isRunning else { return info("busy. ^C stops the current run") }
-        guard let profile = activeProfile else { return fail("no API profile. run /setup") }
-        guard let model = activeModel else { return fail("no model selected. use /model <id>") }
-        append(.user, text)
-        if session.messages.isEmpty { session.title = String(text.prefix(48)) }
-        session.messages.append(ChatMessage(role: .user, content: text))
+        guard !isRunning else {
+            input = text
+            return info("busy. stop the current run first")
+        }
+        // The message box was cleared on submit; put the text back when it cannot be sent.
+        guard let profile = activeProfile else {
+            input = text
+            return fail("no connection yet. add one in Settings, or type /setup")
+        }
+        guard let model = activeModel else {
+            input = text
+            return fail("no model selected. pick one from the model menu")
+        }
+        if let id = editingItemID { rewind(to: id) }
+        editingItemID = nil
+        let attachments = pendingAttachments
+        pendingAttachments = []
+        if session.messages.isEmpty {
+            session.title = Session.title(from: text.isEmpty ? attachments.first?.name ?? "" : text)
+        }
+        session.messages.append(ChatMessage(role: .user, content: Attachments.prompt(text, attachments: attachments)))
+        append(.user, text, messageIndex: session.messages.count - 1,
+               attachments: attachments.isEmpty ? nil : attachments.map(\.path))
+        session.updatedAt = Date()
+        persist()
         startRun(profile: profile, model: model)
     }
 
     private func startRun(profile: Profile, model: String) {
         isRunning = true
         usageLine = nil
-        runStart = Date()
+        runStartedAt = Date()
         assistantItemID = nil
         let apiKey = secrets.secret(for: profile.secretKey) ?? ""
+        let extraHeaders = customHeaders(for: profile)
         if profile.baseURL.lowercased().hasPrefix("http://"), !apiKey.isEmpty {
             info("note: \(profile.name) uses plain http, so the API key is sent unencrypted")
         }
         let history = session.messages
         let host = activeHost
+        let client = self.client
 
         runTask = Task { [weak self] in
             guard let self else { return }
             do {
-                var shell: SSHConnection?
+                var shell: RemoteShell?
                 if let host {
                     do {
-                        shell = try await self.connect(to: host)
+                        shell = try await self.remoteShell(for: host, notes: .chat)
                     } catch {
                         self.fail("ssh \(host.name): \(error.localizedDescription)")
                         self.info("continuing without SSH")
@@ -274,15 +413,16 @@ final class AppModel {
                 let system = SystemPrompt.build(custom: self.settings.systemPrompt, hostLabel: shell == nil ? nil : host?.address)
                 let request = ChatRequest(
                     baseURL: profile.baseURL, apiKey: apiKey, model: model,
-                    messages: [ChatMessage(role: .system, content: system)] + history)
-                let agent = Agent(client: OpenAIClient(), tools: ToolBox(workspace: self.workspace, shell: shell))
+                    messages: [ChatMessage(role: .system, content: system)] + history,
+                    authScheme: profile.authScheme, headers: extraHeaders)
+                let agent = Agent(client: client, tools: ToolBox(workspace: self.workspace, shell: shell))
                 try await agent.run(
                     request: request,
                     approve: { [weak self] _, summary in await self?.requestApproval(summary) ?? .deny },
                     emit: { [weak self] event in await self?.handle(event) })
             } catch {
                 if error is CancellationError || Task.isCancelled {
-                    self.info("^C")
+                    self.info("stopped")
                 } else {
                     self.fail(error.localizedDescription)
                 }
@@ -300,7 +440,7 @@ final class AppModel {
         assistantItemID = nil
         toolItems = [:]
         session.updatedAt = Date()
-        storage.saveSession(session)
+        persist()
     }
 
     private func handle(_ event: AgentEvent) {
@@ -328,7 +468,7 @@ final class AppModel {
                 }
             }
         case .usage(let input, let output):
-            let seconds = Int(Date().timeIntervalSince(runStart).rounded())
+            let seconds = Int(Date().timeIntervalSince(runStartedAt).rounded())
             usageLine = "\(Self.compact(input)) in · \(Self.compact(output)) out · \(seconds)s"
         }
     }
@@ -341,6 +481,112 @@ final class AppModel {
         guard isRunning else { return }
         runTask?.cancel()
         if pendingApproval != nil { resolveApproval(.deny) }
+        // A run restored for a screenshot has no task behind it to wind things down.
+        if runTask == nil { finishRun() }
+    }
+
+    // MARK: Edit and resend
+
+    /// Whether a prompt block still maps onto the model history, so it can be edited or resent.
+    func canRewind(_ item: TranscriptItem) -> Bool {
+        guard item.kind == .user, let index = item.messageIndex, session.messages.indices.contains(index) else { return false }
+        return session.messages[index].role == .user
+    }
+
+    var lastPromptID: UUID? {
+        session.transcript.last { canRewind($0) }?.id
+    }
+
+    /// Puts a sent prompt back in the message box. Sending it replaces that prompt and everything after it.
+    func beginEditing(_ id: UUID) {
+        guard let item = session.transcript.first(where: { $0.id == id }), canRewind(item) else { return }
+        editingItemID = id
+        input = item.text
+        pendingAttachments = reloadAttachments(of: item)
+        historyIndex = nil
+        focusRequests += 1
+    }
+
+    func cancelEditing() {
+        guard editingItemID != nil else { return }
+        editingItemID = nil
+        pendingAttachments = []
+        input = ""
+    }
+
+    /// Sends a prompt again, dropping the replies it got the first time.
+    func resend(_ id: UUID) {
+        guard !isRunning else { return info("busy. stop the current run first") }
+        guard let item = session.transcript.first(where: { $0.id == id }), canRewind(item) else { return fail("nothing to retry") }
+        guard activeProfile != nil, activeModel != nil else { return fail("no connection or model selected") }
+        editingItemID = id
+        pendingAttachments = reloadAttachments(of: item)
+        scrollTick += 1
+        send(item.text)
+    }
+
+    func retryLast() {
+        guard let id = lastPromptID else { return fail("nothing to retry") }
+        resend(id)
+    }
+
+    private func reloadAttachments(of item: TranscriptItem) -> [Attachment] {
+        (item.attachments ?? []).compactMap { try? Attachments.load($0, in: workspace) }
+    }
+
+    /// Drops a prompt and everything after it from the transcript and from the model history.
+    private func rewind(to id: UUID) {
+        guard let position = session.transcript.firstIndex(where: { $0.id == id }),
+              canRewind(session.transcript[position]),
+              let index = session.transcript[position].messageIndex else { return }
+        session.transcript.removeSubrange(position...)
+        session.messages.removeSubrange(index...)
+    }
+
+    // MARK: Attachments
+
+    /// Attaches files chosen in the system picker; they are copied into the workspace first.
+    func attach(_ urls: [URL]) {
+        Task { [weak self, sessionID = session.id] in
+            guard let self else { return }
+            let result = await self.importIntoWorkspace(urls)
+            // Copying takes a moment; the files belong to the session they were picked in.
+            guard self.session.id == sessionID else { return }
+            for failure in result.failures { self.fail(failure) }
+            self.attachWorkspaceFiles(result.paths)
+        }
+    }
+
+    /// Copies picked files into the workspace's uploads folder.
+    func importIntoWorkspace(_ urls: [URL]) async -> ImportResult {
+        let workspace = self.workspace
+        // Copying can be slow for large or iCloud files; keep it off the main thread.
+        let outcomes = await Task.detached {
+            urls.map { url -> Result<Attachment, Error> in Result { try importPickedFile(url, into: workspace) } }
+        }.value
+        var result = ImportResult()
+        for (url, outcome) in zip(urls, outcomes) {
+            switch outcome {
+            case .success(let attachment): result.paths.append(attachment.path)
+            case .failure(let error): result.failures.append("could not import \(url.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+        return result
+    }
+
+    /// Adds files that are already in the workspace to the next prompt.
+    func attachWorkspaceFiles(_ paths: [String]) {
+        for path in paths where !pendingAttachments.contains(where: { $0.path == path }) {
+            do {
+                pendingAttachments.append(try Attachments.load(path, in: workspace))
+            } catch {
+                fail("could not attach \(path): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func removeAttachment(_ id: UUID) {
+        pendingAttachments.removeAll { $0.id == id }
     }
 
     // MARK: Approval
@@ -361,29 +607,63 @@ final class AppModel {
 
     func allowAlways() {
         alwaysAllow = true
-        info("auto-approving tool calls for the rest of this session")
+        info("allowing every action for the rest of this session")
         resolveApproval(.allow)
     }
 
     // MARK: SSH
 
-    private func connect(to host: SSHHost) async throws -> SSHConnection {
+    /// Where connection progress is reported: the chat for the agent, the terminal screen for the terminal.
+    private enum NoteTarget {
+        case chat, console
+    }
+
+    private func note(_ text: String, to target: NoteTarget) {
+        switch target {
+        case .chat: info(text)
+        case .console: console.note(text)
+        }
+    }
+
+    private func remoteShell(for host: SSHHost, notes: NoteTarget) async throws -> RemoteShell {
+        if let demoShell {
+            if !demoShellAnnounced {
+                demoShellAnnounced = true
+                note("connecting to \(host.address)…", to: notes)
+            }
+            return demoShell
+        }
+        return try await connect(to: host, notes: notes)
+    }
+
+    private func connect(to host: SSHHost, notes: NoteTarget) async throws -> SSHConnection {
         if let connection, connectionHostID == host.id, connection.isConnected { return connection }
+        // The agent and the terminal can ask at the same moment; both get the one connection being opened.
+        if let pending = pendingConnect, pending.hostID == host.id { return try await pending.task.value }
+        let task = Task { try await self.openConnection(to: host, notes: notes) }
+        pendingConnect = (host.id, task)
+        defer {
+            if pendingConnect?.hostID == host.id { pendingConnect = nil }
+        }
+        return try await task.value
+    }
+
+    private func openConnection(to host: SSHHost, notes: NoteTarget) async throws -> SSHConnection {
         await dropConnection()
         guard let secret = secrets.secret(for: host.secretKey), !secret.isEmpty else {
-            throw Failure(message: "no password or key stored for this host; open /config")
+            throw Failure(message: "no password or key stored for this host; add one in Settings")
         }
         let credentials = SSHCredentials(
             host: host.host, port: host.port, username: host.username,
             secret: host.auth == .password
                 ? .password(secret)
                 : .privateKey(pem: secret, passphrase: secrets.secret(for: host.passphraseKey)))
-        info("connecting to \(host.address)…")
+        note("connecting to \(host.address)…", to: notes)
         let new = try await SSHConnection.connect(credentials, label: host.name, trustedHostKey: host.trustedHostKey)
         if host.trustedHostKey == nil, !new.hostKey.isEmpty, let index = hosts.firstIndex(where: { $0.id == host.id }) {
             hosts[index].trustedHostKey = new.hostKey
             storage.saveHosts(hosts)
-            info("first connection: trusting host key \(SSHKeys.fingerprint(ofOpenSSHKey: new.hostKey))")
+            note("first connection: trusting host key \(SSHKeys.fingerprint(ofOpenSSHKey: new.hostKey))", to: notes)
         }
         connection = new
         connectionHostID = host.id
@@ -399,16 +679,19 @@ final class AppModel {
 
     /// `!command`: run directly on the active host and tell the model what happened.
     private func runShell(_ command: String) {
-        guard !isRunning else { return info("busy. ^C stops the current run") }
+        guard !isRunning else { return info("busy. stop the current run first") }
         guard let host = activeHost else {
-            return fail("no SSH host selected. add one in /config, then pick it with /host <name>")
+            return fail("no SSH host selected. add one in Settings, then pick it below the message box")
         }
         isRunning = true
+        runStartedAt = Date()
         runTask = Task { [weak self] in
             guard let self else { return }
             var itemID: UUID?
             do {
-                let shell = try await self.connect(to: host)
+                let shell = try await self.remoteShell(for: host, notes: .chat)
+                // Stop may have been pressed while the connection was being opened.
+                try Task.checkCancellation()
                 let id = self.append(.tool, "", title: "ssh \(host.name) $ \(command)", status: .running)
                 itemID = id
                 let (output, continuation) = AsyncStream<String>.makeStream()
@@ -434,7 +717,7 @@ final class AppModel {
             } catch {
                 self.mutateItem(itemID) { $0.status = .failed }
                 if error is CancellationError || Task.isCancelled {
-                    self.info("^C")
+                    self.info("stopped")
                 } else {
                     self.fail("ssh \(host.name): \(error.localizedDescription)")
                 }
@@ -443,36 +726,81 @@ final class AppModel {
         }
     }
 
+    // MARK: Terminal screen
+
+    /// Runs the typed command on the active host. Nothing from here reaches the conversation.
+    func runConsole() {
+        let command = consoleInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !command.isEmpty, !consoleRunning else { return }
+        guard let host = activeHost else {
+            return console.error("no SSH host selected. add one in Settings, then pick it below the message box")
+        }
+        consoleInput = ""
+        console.command(command)
+        consoleRunning = true
+        consoleTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let shell = try await self.remoteShell(for: host, notes: .console)
+                try Task.checkCancellation()
+                let (output, continuation) = AsyncStream<String>.makeStream()
+                let forwarder = Task { [weak self] in
+                    for await chunk in output { self?.console.output(chunk) }
+                }
+                let code: Int
+                do {
+                    code = try await shell.run(command: command, timeout: 300) { continuation.yield($0) }
+                } catch {
+                    continuation.finish()
+                    await forwarder.value
+                    throw error
+                }
+                continuation.finish()
+                await forwarder.value
+                if code != 0 { self.console.note("[exit \(code)]") }
+            } catch {
+                if error is CancellationError || Task.isCancelled {
+                    self.console.note("^C")
+                } else {
+                    self.console.error(error.localizedDescription)
+                }
+            }
+            self.consoleRunning = false
+            self.consoleTask = nil
+        }
+    }
+
+    func cancelConsole() {
+        consoleTask?.cancel()
+    }
+
     // MARK: Commands
 
     private func runCommand(_ name: String, _ args: String) {
         let changesSession = ["new", "sessions", "retry", "clear", "setup"].contains(name)
         if isRunning, changesSession, !(name == "sessions" && args.isEmpty) {
-            return info("busy. ^C stops the current run")
+            return info("busy. stop the current run first")
         }
         switch name {
         case "help":
             let width = Commands.all.map(\.usage.count).max() ?? 0
             let lines = Commands.all.map { $0.usage.padding(toLength: width + 2, withPad: " ", startingAt: 0) + $0.help }
-            info(lines.joined(separator: "\n") + "\n\n!<command>  run a command on the SSH host yourself\n^C          stop the current run")
+            info(lines.joined(separator: "\n") + "\n\n!<command>  run a command on the SSH host yourself")
         case "setup":
             setup = .name
-            info("new API profile. esc cancels.\nprofile name (e.g. openrouter):")
+            info("new connection. esc cancels.\nname (e.g. openrouter):")
         case "config":
-            showSettings = true
+            openSettings()
         case "model": modelCommand(args)
         case "profile": profileCommand(args)
         case "host": hostCommand(args)
         case "approve":
             if let mode = ApprovalMode(rawValue: args.lowercased()) {
-                update { $0.approvalMode = mode }
-                if mode == .ask { alwaysAllow = false }
+                setApprovalMode(mode)
             } else if !args.isEmpty {
                 return fail("usage: /approve ask|auto")
             }
-            info(settings.approvalMode == .ask
-                 ? "approval: ask before commands, file writes and web requests"
-                 : "approval: auto. tool calls run without asking")
+            info("permissions: \(settings.approvalMode.label). \(settings.approvalMode.summary)")
         case "theme":
             if args.isEmpty {
                 info(Theme.all.map { ($0.id == theme.id ? "* " : "  ") + $0.id.padding(toLength: 11, withPad: " ", startingAt: 0) + $0.name }
@@ -494,8 +822,10 @@ final class AppModel {
             startNewSession()
         case "sessions": sessionsCommand(args)
         case "retry":
+            if let id = lastPromptID { return resend(id) }
+            // Sessions saved before prompts were linked to the history: rerun without trimming the screen.
             guard let index = session.messages.lastIndex(where: { $0.role == .user }) else { return fail("nothing to retry") }
-            guard let profile = activeProfile, let model = activeModel else { return fail("no profile or model selected") }
+            guard let profile = activeProfile, let model = activeModel else { return fail("no connection or model selected") }
             session.messages.removeSubrange((index + 1)...)
             startRun(profile: profile, model: model)
         case "copy":
@@ -507,21 +837,14 @@ final class AppModel {
             shareItem = ShareItem(text: Markdown.export(session))
         case "clear":
             session.transcript.removeAll()
+            editingItemID = nil
         default:
             fail("unknown command: /\(name)")
         }
     }
 
-    private func startNewSession() {
-        storage.saveSession(session)
-        session = Session()
-        alwaysAllow = false
-        usageLine = nil
-        info("new session")
-    }
-
     private func modelCommand(_ args: String) {
-        guard let profile = activeProfile else { return fail("no API profile. run /setup") }
+        guard let profile = activeProfile else { return fail("no connection yet. add one in Settings, or type /setup") }
         if args.isEmpty {
             let current = activeModel
             let lines = profile.models.map { ($0 == current ? "* " : "  ") + $0 }
@@ -535,38 +858,24 @@ final class AppModel {
         info("model: \(chosen)")
     }
 
-    func select(model: String, in profileID: UUID) {
-        if let index = profiles.firstIndex(where: { $0.id == profileID }), !profiles[index].models.contains(model) {
-            profiles[index].models.append(model)
-            storage.saveProfiles(profiles)
-        }
-        update {
-            $0.activeProfileID = profileID
-            $0.activeModel = model
-        }
-    }
-
     private func profileCommand(_ args: String) {
         if args.isEmpty {
             let current = activeProfile?.id
             let lines = profiles.map { ($0.id == current ? "* " : "  ") + $0.name + "  " + $0.baseURL }
-            return info(lines.isEmpty ? "no profiles. run /setup" : lines.joined(separator: "\n"))
+            return info(lines.isEmpty ? "no connections. add one in Settings, or type /setup" : lines.joined(separator: "\n"))
         }
         guard let match = profiles.first(where: { $0.name.lowercased().hasPrefix(args.lowercased()) }) else {
-            return fail("no profile named \(args)")
+            return fail("no connection named \(args)")
         }
-        update {
-            $0.activeProfileID = match.id
-            $0.activeModel = match.preferredModel
-        }
-        info("profile: \(match.name) · \(match.preferredModel ?? "no model")")
+        selectProfile(match.id)
+        info("connection: \(match.name) · \(match.preferredModel ?? "no model")")
     }
 
     private func hostCommand(_ args: String) {
         if args.isEmpty {
             let current = activeHost?.id
             let lines = hosts.map { ($0.id == current ? "* " : "  ") + $0.name + "  " + $0.address }
-            return info(lines.isEmpty ? "no SSH hosts. add one in /config" : lines.joined(separator: "\n") + (current == nil ? "\n(none selected)" : ""))
+            return info(lines.isEmpty ? "no SSH hosts. add one in Settings" : lines.joined(separator: "\n") + (current == nil ? "\n(none selected)" : ""))
         }
         if ["off", "none"].contains(args.lowercased()) {
             selectHost(nil)
@@ -579,30 +888,196 @@ final class AppModel {
         info("ssh: \(match.name) (\(match.address)). connects on first use")
     }
 
+    private func sessionsCommand(_ args: String) {
+        if args.isEmpty {
+            listedSessions = Array(storage.sessionSummaries().prefix(20))
+            let lines = listedSessions.enumerated().map { index, summary in
+                "\(index + 1)".padding(toLength: 4, withPad: " ", startingAt: 0)
+                    + RelativeTime.short(summary.updatedAt).padding(toLength: 13, withPad: " ", startingAt: 0) + summary.title
+            }
+            return info(lines.isEmpty ? "no saved sessions" : lines.joined(separator: "\n") + "\n\n/sessions <n> opens one")
+        }
+        guard let number = Int(args), listedSessions.indices.contains(number - 1) else {
+            return fail("run /sessions first, then /sessions <n>")
+        }
+        switchSession(listedSessions[number - 1].id)
+    }
+
+    // MARK: Sessions
+
+    /// Saves the current session and refreshes the list the sidebar shows.
+    private func persist() {
+        storage.saveSession(session)
+        sessionList = storage.sessionSummaries()
+    }
+
+    func refreshSessions() {
+        sessionList = storage.sessionSummaries()
+    }
+
+    private func resetSessionState() {
+        // A half-finished /setup belongs to the session it was started in.
+        setup = nil
+        alwaysAllow = false
+        usageLine = nil
+        editingItemID = nil
+        pendingAttachments = []
+        expandedTools = []
+        expandedGroups = []
+        input = ""
+    }
+
+    private func startNewSession() {
+        persist()
+        session = Session()
+        resetSessionState()
+    }
+
+    func newSession() {
+        closeSidebar()
+        activeSheet = nil
+        guard !isRunning else { return info("busy. stop the current run before starting a new session") }
+        guard !session.transcript.isEmpty || !session.isEmpty else { return }
+        startNewSession()
+    }
+
+    func switchSession(_ id: UUID) {
+        closeSidebar()
+        activeSheet = nil
+        guard id != session.id else { return }
+        guard !isRunning else { return info("busy. stop the current run before switching sessions") }
+        guard let loaded = storage.loadSession(id: id) else {
+            refreshSessions()
+            return fail("that session could not be opened")
+        }
+        persist()
+        session = loaded
+        resetSessionState()
+        scrollTick += 1
+    }
+
+    func deleteSession(_ id: UUID) {
+        let isCurrent = id == session.id
+        guard !(isCurrent && isRunning) else { return }
+        storage.deleteSession(id: id)
+        if isCurrent {
+            session = Session()
+            resetSessionState()
+        }
+        refreshSessions()
+    }
+
+    func renameSession(_ id: UUID, to title: String) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if id == session.id { session.title = trimmed }
+        storage.renameSession(id: id, title: trimmed)
+        refreshSessions()
+    }
+
+    func searchSessions(_ query: String) -> [SessionMatch] {
+        storage.searchSessions(query)
+    }
+
+    // MARK: Connections
+
+    func select(model: String, in profileID: UUID) {
+        if let index = profiles.firstIndex(where: { $0.id == profileID }), !profiles[index].models.contains(model) {
+            profiles[index].models.append(model)
+            storage.saveProfiles(profiles)
+        }
+        update {
+            $0.activeProfileID = profileID
+            $0.activeModel = model
+        }
+    }
+
+    func selectProfile(_ id: UUID) {
+        guard let profile = profiles.first(where: { $0.id == id }) else { return }
+        update {
+            $0.activeProfileID = profile.id
+            $0.activeModel = profile.preferredModel
+        }
+    }
+
+    func apiKey(for profile: Profile) -> String { secrets.secret(for: profile.secretKey) ?? "" }
+
+    func customHeaders(for profile: Profile) -> [HeaderField] {
+        Headers.decode(secrets.secret(for: profile.headersKey))
+    }
+
+    func saveProfile(_ profile: Profile, apiKey: String, headers: [HeaderField] = []) {
+        if let index = profiles.firstIndex(where: { $0.id == profile.id }) {
+            profiles[index] = profile
+        } else {
+            profiles.append(profile)
+        }
+        storage.saveProfiles(profiles)
+        secrets.setSecret(apiKey, for: profile.secretKey)
+        secrets.setSecret(Headers.encode(headers), for: profile.headersKey)
+        if settings.activeProfileID == nil || profiles.count == 1 {
+            update {
+                $0.activeProfileID = profile.id
+                $0.activeModel = profile.preferredModel
+            }
+        } else if settings.activeProfileID == profile.id, let model = settings.activeModel, !profile.models.contains(model) {
+            update { $0.activeModel = profile.preferredModel }
+        }
+    }
+
+    func deleteProfile(_ profile: Profile) {
+        profiles.removeAll { $0.id == profile.id }
+        storage.saveProfiles(profiles)
+        secrets.setSecret(nil, for: profile.secretKey)
+        secrets.setSecret(nil, for: profile.headersKey)
+        if settings.activeProfileID == profile.id {
+            update {
+                $0.activeProfileID = profiles.first?.id
+                $0.activeModel = profiles.first?.preferredModel
+            }
+        }
+    }
+
+    /// The model IDs a gateway advertises. Demo mode answers from the saved connection instead of the network.
+    func listModels(baseURL: String, apiKey: String, authScheme: AuthScheme, headers: [HeaderField]) async throws -> [String] {
+        if isDemo {
+            try await Task.sleep(for: .milliseconds(300))
+            return profiles.first?.models ?? []
+        }
+        return try await OpenAIClient().listModels(baseURL: baseURL, apiKey: apiKey, authScheme: authScheme, headers: headers)
+    }
+
+    // MARK: SSH hosts
+
+    func hostSecret(for host: SSHHost) -> String { secrets.secret(for: host.secretKey) ?? "" }
+    func hostPassphrase(for host: SSHHost) -> String { secrets.secret(for: host.passphraseKey) ?? "" }
+
     func selectHost(_ id: UUID?) {
         update { $0.activeHostID = id }
         if connectionHostID != id { Task { await dropConnection() } }
     }
 
-    private func sessionsCommand(_ args: String) {
-        if args.isEmpty {
-            listedSessions = Array(storage.sessionSummaries().prefix(20))
-            let formatter = DateFormatter()
-            formatter.dateFormat = "MMM d HH:mm"
-            let lines = listedSessions.enumerated().map { index, summary in
-                "\(index + 1)".padding(toLength: 4, withPad: " ", startingAt: 0) + formatter.string(from: summary.updatedAt) + "  " + summary.title
-            }
-            return info(lines.isEmpty ? "no saved sessions" : lines.joined(separator: "\n") + "\n\n/sessions <n> resumes one")
+    func saveHost(_ host: SSHHost, secret: String, passphrase: String) {
+        let isFirst = hosts.isEmpty
+        if let index = hosts.firstIndex(where: { $0.id == host.id }) {
+            hosts[index] = host
+        } else {
+            hosts.append(host)
         }
-        guard let number = Int(args), listedSessions.indices.contains(number - 1),
-              let loaded = storage.loadSession(id: listedSessions[number - 1].id) else {
-            return fail("run /sessions first, then /sessions <n>")
-        }
-        storage.saveSession(session)
-        session = loaded
-        alwaysAllow = false
-        usageLine = nil
-        info("resumed: \(loaded.title)")
+        storage.saveHosts(hosts)
+        secrets.setSecret(secret, for: host.secretKey)
+        secrets.setSecret(passphrase, for: host.passphraseKey)
+        if isFirst { update { $0.activeHostID = host.id } }
+        // Reconnect with the new details on next use.
+        if connectionHostID == host.id { Task { await dropConnection() } }
+    }
+
+    func deleteHost(_ host: SSHHost) {
+        hosts.removeAll { $0.id == host.id }
+        storage.saveHosts(hosts)
+        secrets.setSecret(nil, for: host.secretKey)
+        secrets.setSecret(nil, for: host.passphraseKey)
+        if settings.activeHostID == host.id { selectHost(nil) }
     }
 
     // MARK: Setup wizard
@@ -610,7 +1085,7 @@ final class AppModel {
     private func advanceSetup(_ step: SetupStep, _ value: String) {
         switch step {
         case .name:
-            guard !value.isEmpty else { return info("profile name:") }
+            guard !value.isEmpty else { return info("name:") }
             append(.user, value)
             setup = .baseURL(name: value)
             info("base URL (e.g. https://api.openai.com/v1):")
@@ -628,7 +1103,7 @@ final class AppModel {
                 var models: [String] = []
                 var problem: String?
                 do {
-                    models = try await OpenAIClient().listModels(baseURL: baseURL, apiKey: value)
+                    models = try await self?.listModels(baseURL: baseURL, apiKey: value, authScheme: .bearer, headers: []) ?? []
                 } catch {
                     problem = error.localizedDescription
                 }
@@ -658,96 +1133,114 @@ final class AppModel {
                 $0.activeModel = chosen
             }
             setup = nil
-            info("saved. \(name) · \(chosen) is active. say something.")
+            info("saved. \(name) · \(chosen) is active.")
         }
-    }
-
-    // MARK: Settings screen support
-
-    func apiKey(for profile: Profile) -> String { secrets.secret(for: profile.secretKey) ?? "" }
-
-    func saveProfile(_ profile: Profile, apiKey: String) {
-        if let index = profiles.firstIndex(where: { $0.id == profile.id }) {
-            profiles[index] = profile
-        } else {
-            profiles.append(profile)
-        }
-        storage.saveProfiles(profiles)
-        secrets.setSecret(apiKey, for: profile.secretKey)
-        if settings.activeProfileID == nil || profiles.count == 1 {
-            update {
-                $0.activeProfileID = profile.id
-                $0.activeModel = profile.preferredModel
-            }
-        } else if settings.activeProfileID == profile.id, let model = settings.activeModel, !profile.models.contains(model) {
-            update { $0.activeModel = profile.preferredModel }
-        }
-    }
-
-    func deleteProfile(_ profile: Profile) {
-        profiles.removeAll { $0.id == profile.id }
-        storage.saveProfiles(profiles)
-        secrets.setSecret(nil, for: profile.secretKey)
-        if settings.activeProfileID == profile.id {
-            update {
-                $0.activeProfileID = profiles.first?.id
-                $0.activeModel = profiles.first?.preferredModel
-            }
-        }
-    }
-
-    func hostSecret(for host: SSHHost) -> String { secrets.secret(for: host.secretKey) ?? "" }
-    func hostPassphrase(for host: SSHHost) -> String { secrets.secret(for: host.passphraseKey) ?? "" }
-
-    func saveHost(_ host: SSHHost, secret: String, passphrase: String) {
-        let isFirst = hosts.isEmpty
-        if let index = hosts.firstIndex(where: { $0.id == host.id }) {
-            hosts[index] = host
-        } else {
-            hosts.append(host)
-        }
-        storage.saveHosts(hosts)
-        secrets.setSecret(secret, for: host.secretKey)
-        secrets.setSecret(passphrase, for: host.passphraseKey)
-        if isFirst { update { $0.activeHostID = host.id } }
-        // Reconnect with the new details on next use.
-        if connectionHostID == host.id { Task { await dropConnection() } }
-    }
-
-    func deleteHost(_ host: SSHHost) {
-        hosts.removeAll { $0.id == host.id }
-        storage.saveHosts(hosts)
-        secrets.setSecret(nil, for: host.secretKey)
-        secrets.setSecret(nil, for: host.passphraseKey)
-        if settings.activeHostID == host.id { selectHost(nil) }
     }
 
     // MARK: Demo content
 
-    private func loadDemo(withApproval: Bool) {
+    private func loadDemo(_ arguments: [String]) {
         let profile = Profile(name: "openrouter", baseURL: "https://openrouter.ai/api/v1",
                               models: ["anthropic/claude-sonnet-5", "openai/gpt-6-luna"], defaultModel: "anthropic/claude-sonnet-5")
         let host = SSHHost(name: "web1", host: "10.0.0.12", username: "deploy")
         profiles = [profile]
         hosts = [host]
+        secrets.setSecret("placeholder-key-for-demo-mode", for: profile.secretKey)
+        secrets.setSecret(Headers.encode([HeaderField(name: "HTTP-Referer", value: "https://termai.example")]), for: profile.headersKey)
         settings = AppSettings(activeProfileID: profile.id, activeModel: profile.defaultModel, activeHostID: host.id,
-                               themeID: UserDefaults.standard.string(forKey: "theme") ?? Theme.minimalDark.id)
-        session = Session(title: "demo", messages: [ChatMessage(role: .user, content: "demo")])
-        append(.info, "TermAI · /help for commands")
-        append(.user, "why is nginx down on web1?")
-        append(.assistant, "Checking the service state first.")
-        append(.tool, "× nginx.service - A high performance web server\n     Active: failed (Result: exit-code)\nnginx: [emerg] unknown directive \"servr_name\"\n  in /etc/nginx/sites-enabled/app:4\n[exit 3]",
-               title: "ssh web1 $ systemctl status nginx --no-pager", status: .failed)
-        append(.assistant, "There is a typo in the site config, line 4:\n\n```nginx\nservr_name example.com;\n```\n\nIt should be `server_name`. I can fix it and reload:")
-        if withApproval {
-            append(.tool, "", title: "ssh web1 $ sudo sed -i 's/servr_name/server_name/' /etc/nginx/sites-enabled/app && sudo nginx -t && sudo systemctl reload nginx", status: .running)
-            isRunning = true
-            pendingApproval = PendingApproval(summary: "ssh web1 $ sudo sed -i 's/servr_name/server_name/' /etc/nginx/sites-enabled/app && sudo nginx -t && sudo systemctl reload nginx")
-        } else {
-            append(.tool, "nginx: configuration file /etc/nginx/nginx.conf test is successful",
-                   title: "ssh web1 $ sudo sed -i 's/servr_name/server_name/' /etc/nginx/sites-enabled/app && sudo nginx -t && sudo systemctl reload nginx", status: .ok)
-            append(.assistant, "Fixed. nginx is serving again.")
-            usageLine = "2.4k in · 312 out · 9s"
+                               themeID: UserDefaults.standard.string(forKey: "theme") ?? Theme.dark.id)
+
+        let earlier: [(title: String, age: TimeInterval)] = [
+            ("Rotate the deploy keys", 3 * 3_600), ("Draft release notes for 0.2", 26 * 3_600), ("Disk usage report for db1", 4 * 86_400),
+        ]
+        for entry in earlier {
+            storage.saveSession(Session(
+                title: entry.title, updatedAt: Date().addingTimeInterval(-entry.age),
+                messages: [ChatMessage(role: .user, content: entry.title), ChatMessage(role: .assistant, content: "Done on web1.")],
+                transcript: [TranscriptItem(kind: .user, text: entry.title, messageIndex: 0),
+                             TranscriptItem(kind: .assistant, text: "Done on web1.")]))
         }
+        for (path, content) in DemoContent.files {
+            let url = workspace.appendingPathComponent(path)
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? Data(content.utf8).write(to: url)
+        }
+
+        if !arguments.contains("-demoEmpty") {
+            loadDemoConversation(steps: arguments.contains("-demoSteps"), approval: arguments.contains("-demoApproval"))
+        }
+        refreshSessions()
+
+        if arguments.contains("-demoCompose") {
+            editingItemID = lastPromptID
+            input = "why is nginx down on web1? check the error log too"
+            attachWorkspaceFiles(["nginx-app.conf", "report.md"])
+        }
+        if arguments.contains("-demoTerminal") {
+            console.note("connecting to \(host.address)…")
+            demoShellAnnounced = true
+            for command in ["uptime", "df -h /"] {
+                console.command(command)
+                console.output(DemoShell.output(for: command).text)
+            }
+            activeSheet = .terminal
+        }
+        if arguments.contains("-demoSidebar") { showSidebar = true }
+        if arguments.contains("-demoSettings") { activeSheet = .settings }
+        if arguments.contains("-demoConnection") { openSettings(.connection(profile.id)) }
+        if arguments.contains("-demoHost") { openSettings(.host(host.id)) }
+        if arguments.contains("-demoFiles") { activeSheet = .files }
+        if arguments.contains("-demoModels") { activeSheet = .models }
+        if arguments.contains("-demoSearch") { activeSheet = .search }
     }
+
+    private func loadDemoConversation(steps: Bool, approval: Bool) {
+        let prompt = steps ? "audit web1 before the release" : DemoContent.prompt
+        session = Session(title: Session.title(from: prompt), messages: [ChatMessage(role: .user, content: prompt)])
+        append(.user, prompt, messageIndex: 0)
+
+        if steps {
+            append(.assistant, "Running the pre-release checks on web1.")
+            var failed: UUID?
+            for step in DemoContent.auditSteps {
+                let id = append(.tool, step.output, title: "ssh web1 $ \(step.command)", status: step.ok ? .ok : .failed)
+                if !step.ok { failed = id }
+            }
+            if let failed { expandedTools = [failed] }
+            append(.assistant, DemoContent.auditAnswer)
+            usageLine = "6.1k in · 540 out · 21s"
+        } else {
+            append(.assistant, "Checking the service state first.")
+            append(.tool, DemoShell.output(for: DemoContent.statusCommand).text + "[exit 3]",
+                   title: "ssh web1 $ \(DemoContent.statusCommand)", status: .failed)
+            append(.assistant, DemoContent.diagnosis)
+            if approval {
+                append(.tool, "", title: "ssh web1 $ \(DemoContent.fixCommand)", status: .running)
+                isRunning = true
+                pendingApproval = PendingApproval(summary: "ssh web1 $ \(DemoContent.fixCommand)")
+            } else {
+                append(.tool, DemoShell.output(for: DemoContent.fixCommand).text,
+                       title: "ssh web1 $ \(DemoContent.fixCommand)", status: .ok)
+                append(.assistant, DemoContent.resolution)
+                usageLine = "2.4k in · 312 out · 9s"
+            }
+        }
+        storage.saveSession(session)
+    }
+}
+
+/// Copies a file chosen in the picker into the workspace. Picked URLs are security-scoped and may be
+/// iCloud placeholders, so the scope is opened and the read goes through a file coordinator.
+private func importPickedFile(_ url: URL, into workspace: URL) throws -> Attachment {
+    let scoped = url.startAccessingSecurityScopedResource()
+    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+
+    var coordinationError: NSError?
+    var outcome: Result<Attachment, Error>?
+    NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { readable in
+        outcome = Result { try Attachments.importFile(at: readable, into: workspace) }
+    }
+    if let coordinationError { throw coordinationError }
+    guard let outcome else { throw Failure(message: "the file could not be read") }
+    return try outcome.get()
 }

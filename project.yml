@@ -52,3 +52,33 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+  # Drives the app in demo mode on a simulator; see UITests/TermAIUITests.swift.
+  TermAIUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: TermAI
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.hgfh34bnvcn.termai.uitests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_TARGET_NAME: TermAI
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+schemes:
+  TermAI:
+    build:
+      targets:
+        TermAI: all
+        TermAIUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - TermAIUITests
+    archive:
+      config: Release
