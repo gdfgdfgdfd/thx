@@ -110,6 +110,8 @@ private struct TopBar: View {
                 .font(palette.label)
                 .foregroundStyle(palette.dim)
                 .lineLimit(1)
+                // The conversation scrolls underneath; the title must not swallow taps meant for it.
+                .allowsHitTesting(false)
                 .accessibilityIdentifier("session-title")
 
             Spacer(minLength: 8)

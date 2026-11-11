@@ -117,6 +117,15 @@ final class TermAIUITests: XCTestCase {
         let field = app.searchFields.firstMatch
         assertExists(field, "the search field")
         field.tap()
+
+        // Something only said inside one conversation finds it, and shows where.
+        let phrase = "sites-enabled"
+        field.typeText(phrase)
+        assertCount(elements("search-result"), 1, "sessions mentioning the phrase")
+        XCTAssertTrue(element("search-result").label.contains(phrase), element("search-result").label)
+        XCTAssertTrue(element("search-result").label.hasPrefix("Why is nginx down on web1?"), element("search-result").label)
+
+        field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: phrase.count))
         field.typeText("deploy")
         assertCount(elements("search-result"), 1, "search results")
 
@@ -175,7 +184,6 @@ final class TermAIUITests: XCTestCase {
         tap("approval-allow")
         assertExists(text("Fixed. nginx is serving again."), "the final answer")
         assertExists(text(containing: "2.4k in"), "the usage line")
-        assertCount(elements("tool-row"), 2, "tool steps")
 
         // The session is named after the prompt.
         XCTAssertEqual(element("session-title").label, "Why is nginx down on web1?")

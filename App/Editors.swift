@@ -30,8 +30,12 @@ struct ConnectionEditor: View {
     }
 
     private var canSave: Bool {
-        !profile.name.trimmingCharacters(in: .whitespaces).isEmpty
-            && URL(string: profile.baseURL.trimmingCharacters(in: .whitespaces))?.host != nil
+        !profile.name.trimmingCharacters(in: .whitespaces).isEmpty && canTest
+    }
+
+    /// The gateway can be tried as soon as there is an address, before the connection has a name.
+    private var canTest: Bool {
+        URL(string: profile.baseURL.trimmingCharacters(in: .whitespaces))?.host != nil
     }
 
     var body: some View {
@@ -100,7 +104,7 @@ struct ConnectionEditor: View {
                 .background(palette.surface, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
             }
             .buttonStyle(.plain)
-            .disabled(test == .running || !canSave)
+            .disabled(test == .running || !canTest)
             .accessibilityIdentifier("connection-test")
         } content: {
             testResult(palette)
@@ -224,7 +228,7 @@ struct ConnectionEditor: View {
                 .background(palette.surface, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
             }
             .buttonStyle(.plain)
-            .disabled(isFetching || !canSave)
+            .disabled(isFetching || !canTest)
             .accessibilityIdentifier("connection-fetch")
         } content: {
             if let fetchMessage {
@@ -407,9 +411,11 @@ struct HostEditor: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .onChange(of: host.auth) {
-                secret = ""
-                passphrase = ""
+            .onChange(of: host.auth) { _, method in
+                // Switching back to the method that is saved brings its secret back rather than wiping it.
+                let isSaved = model.hosts.first { $0.id == host.id }?.auth == method
+                secret = isSaved ? model.hostSecret(for: host) : ""
+                passphrase = isSaved ? model.hostPassphrase(for: host) : ""
             }
 
             if host.auth == .password {

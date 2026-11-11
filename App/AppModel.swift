@@ -359,8 +359,15 @@ final class AppModel {
             input = text
             return info("busy. stop the current run first")
         }
-        guard let profile = activeProfile else { return fail("no connection yet. add one in Settings, or type /setup") }
-        guard let model = activeModel else { return fail("no model selected. pick one from the model menu") }
+        // The message box was cleared on submit; put the text back when it cannot be sent.
+        guard let profile = activeProfile else {
+            input = text
+            return fail("no connection yet. add one in Settings, or type /setup")
+        }
+        guard let model = activeModel else {
+            input = text
+            return fail("no model selected. pick one from the model menu")
+        }
         if let id = editingItemID { rewind(to: id) }
         editingItemID = nil
         let attachments = pendingAttachments
@@ -540,9 +547,11 @@ final class AppModel {
 
     /// Attaches files chosen in the system picker; they are copied into the workspace first.
     func attach(_ urls: [URL]) {
-        Task { [weak self] in
+        Task { [weak self, sessionID = session.id] in
             guard let self else { return }
             let result = await self.importIntoWorkspace(urls)
+            // Copying takes a moment; the files belong to the session they were picked in.
+            guard self.session.id == sessionID else { return }
             for failure in result.failures { self.fail(failure) }
             self.attachWorkspaceFiles(result.paths)
         }
@@ -681,6 +690,8 @@ final class AppModel {
             var itemID: UUID?
             do {
                 let shell = try await self.remoteShell(for: host, notes: .chat)
+                // Stop may have been pressed while the connection was being opened.
+                try Task.checkCancellation()
                 let id = self.append(.tool, "", title: "ssh \(host.name) $ \(command)", status: .running)
                 itemID = id
                 let (output, continuation) = AsyncStream<String>.makeStream()
@@ -731,6 +742,7 @@ final class AppModel {
             guard let self else { return }
             do {
                 let shell = try await self.remoteShell(for: host, notes: .console)
+                try Task.checkCancellation()
                 let (output, continuation) = AsyncStream<String>.makeStream()
                 let forwarder = Task { [weak self] in
                     for await chunk in output { self?.console.output(chunk) }
@@ -904,6 +916,8 @@ final class AppModel {
     }
 
     private func resetSessionState() {
+        // A half-finished /setup belongs to the session it was started in.
+        setup = nil
         alwaysAllow = false
         usageLine = nil
         editingItemID = nil

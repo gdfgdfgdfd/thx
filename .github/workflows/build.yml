@@ -111,6 +111,8 @@ jobs:
 
       # Taps through the app in demo mode: sessions, files, a full agent run with approvals, the terminal, settings.
       - name: UI tests
+        # An explicit shell turns on pipefail, so a failing test fails the step and not just the log filter.
+        shell: bash
         run: |
           xcodebuild test-without-building \
             -project TermAI.xcodeproj -scheme TermAI \
