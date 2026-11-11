@@ -66,7 +66,7 @@ final class TermAIUITests: XCTestCase {
         target.tap()
     }
 
-    private func type(_ string: String, into identifier: String, file: StaticString = #filePath, line: UInt = #line) {
+    private func enter(_ string: String, into identifier: String, file: StaticString = #filePath, line: UInt = #line) {
         let field = element(identifier)
         assertExists(field, identifier, file: file, line: line)
         field.tap()
@@ -147,7 +147,7 @@ final class TermAIUITests: XCTestCase {
         tap("empty-files")
         assertExists(app.navigationBars["Files"], "the files sheet")
 
-        type("nginx", into: "files-filter")
+        enter("nginx", into: "files-filter")
         assertExists(element("file-nginx-app.conf"), "the filtered file")
         assertGone(element("file-report.md"), "a file the filter should hide")
 
@@ -164,7 +164,7 @@ final class TermAIUITests: XCTestCase {
         launch("-demoEmpty")
         assertExists(text("Ready when you are"), "the empty session")
 
-        type("why is nginx down on web1?", into: "composer-input")
+        enter("why is nginx down on web1?", into: "composer-input")
         tap("composer-send")
 
         // Each command waits for an answer before it runs.
@@ -183,7 +183,7 @@ final class TermAIUITests: XCTestCase {
 
     func testDenyingAnActionAndStoppingTheRun() {
         launch("-demoEmpty")
-        type("why is nginx down on web1?", into: "composer-input")
+        enter("why is nginx down on web1?", into: "composer-input")
         tap("composer-send")
         assertExists(text("Allow this action?"), "the approval request")
         tap("approval-deny")
@@ -248,7 +248,7 @@ final class TermAIUITests: XCTestCase {
         assertExists(app.navigationBars["Terminal"], "the terminal sheet")
         assertExists(text(containing: "stay out of the chat"), "the terminal's explanation")
 
-        type("uptime", into: "terminal-input")
+        enter("uptime", into: "terminal-input")
         tap("terminal-run")
         assertExists(text(containing: "up 41 days"), "the command's output")
 
@@ -280,8 +280,9 @@ final class TermAIUITests: XCTestCase {
         tap("sidebar-settings")
         assertExists(app.navigationBars["Settings"], "settings")
 
-        // The sidebar's connection menu also starts with the name; this is the row in the settings list.
-        app.collectionViews.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "openrouter")).firstMatch.tap()
+        // The sidebar's connection menu also starts with the name; the row in the settings list shows the URL too.
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@ AND label CONTAINS %@", "openrouter", "openrouter.ai"))
+            .firstMatch.tap()
         assertExists(text("Connection"), "the connection editor")
         XCTAssertTrue(text("Custom headers").exists, "the custom headers section")
 
