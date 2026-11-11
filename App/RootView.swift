@@ -93,18 +93,12 @@ private struct TopBar: View {
         let palette = model.palette
 
         HStack(spacing: 10) {
-            Button {
-                model.openSidebar()
-            } label: {
-                Image(systemName: "sidebar.left")
-                    .font(.system(size: 17))
-                    .foregroundStyle(palette.text)
-                    .frame(width: Metrics.barButton, height: Metrics.barButton)
-                    .glass(in: Circle(), interactive: true)
+            // The glass goes around the button, as in the group on the right. Inside the button's label
+            // it took the touch itself and the button never fired.
+            HStack(spacing: 0) {
+                barButton("sidebar.left", "Sidebar", "topbar-sidebar", palette) { model.openSidebar() }
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Sidebar")
-            .accessibilityIdentifier("topbar-sidebar")
+            .glass(in: Circle())
 
             Text(model.session.title)
                 .font(palette.label)

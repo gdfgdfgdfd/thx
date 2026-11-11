@@ -24,7 +24,8 @@ final class TermAIUITests: XCTestCase {
     }
 
     private func elements(_ identifier: String) -> XCUIElementQuery {
-        app.descendants(matching: .any).matching(identifier: identifier)
+        // Buttons only: a bar wraps its buttons in a second element carrying the same identifier.
+        app.buttons.matching(identifier: identifier)
     }
 
     private func text(_ label: String) -> XCUIElement {
@@ -60,16 +61,31 @@ final class TermAIUITests: XCTestCase {
         }
     }
 
+    /// Taps where a finger would. XCUITest's own tap silently does nothing when it considers the element
+    /// covered, which it can wrongly do for a control sitting just above the keyboard.
+    private func press(_ target: XCUIElement) {
+        if !target.isHittable {
+            // The layout may still be moving, e.g. a keyboard sliding in.
+            let hittable = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isHittable == true"), object: target)
+            _ = XCTWaiter().wait(for: [hittable], timeout: 6)
+        }
+        if target.isHittable {
+            target.tap()
+        } else {
+            target.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        }
+    }
+
     private func tap(_ identifier: String, file: StaticString = #filePath, line: UInt = #line) {
         let target = element(identifier)
         assertExists(target, identifier, file: file, line: line)
-        target.tap()
+        press(target)
     }
 
     private func enter(_ string: String, into identifier: String, file: StaticString = #filePath, line: UInt = #line) {
         let field = element(identifier)
         assertExists(field, identifier, file: file, line: line)
-        field.tap()
+        press(field)
         field.typeText(string)
     }
 
@@ -90,7 +106,7 @@ final class TermAIUITests: XCTestCase {
         assertCount(elements("recent-session"), 4, "recent sessions")
 
         // Tapping a recent session opens it and closes the sidebar.
-        button(startingWith: "Rotate the deploy keys").tap()
+        press(button(startingWith: "Rotate the deploy keys"))
         assertGone(text("Recents"), "the sidebar")
         assertExists(text("Done on web1."), "the other session's conversation")
         XCTAssertEqual(element("session-title").label, "Rotate the deploy keys")
@@ -98,7 +114,7 @@ final class TermAIUITests: XCTestCase {
         // And back again: the first session was saved and reopens as it was.
         tap("topbar-sidebar")
         assertExists(text("Recents"), "the sidebar")
-        button(startingWith: "Why is nginx down on web1?").tap()
+        press(button(startingWith: "Why is nginx down on web1?"))
         assertExists(text("Fixed. nginx is serving again."), "the first session's conversation")
 
         tap("topbar-sidebar")
@@ -116,7 +132,7 @@ final class TermAIUITests: XCTestCase {
 
         let field = app.searchFields.firstMatch
         assertExists(field, "the search field")
-        field.tap()
+        press(field)
 
         // Something only said inside one conversation finds it, and shows where.
         let phrase = "sites-enabled"
@@ -289,17 +305,21 @@ final class TermAIUITests: XCTestCase {
         assertExists(app.navigationBars["Settings"], "settings")
 
         // The sidebar's connection menu also starts with the name; the row in the settings list shows the URL too.
-        app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@ AND label CONTAINS %@", "openrouter", "openrouter.ai"))
-            .firstMatch.tap()
+        let row = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@ AND label CONTAINS %@", "openrouter", "openrouter.ai")).firstMatch
+        assertExists(row, "the connection in the settings list")
+        press(row)
         assertExists(text("Connection"), "the connection editor")
         XCTAssertTrue(text("Custom headers").exists, "the custom headers section")
 
         tap("connection-test")
-        assertExists(text("Connected · 2 models available"), "the connection test result")
+        let result = element("connection-test-result")
+        assertExists(result, "the connection test result")
+        XCTAssertEqual(result.label, "Connected · 2 models available")
 
-        app.buttons["Cancel"].firstMatch.tap()
+        press(app.buttons["Cancel"].firstMatch)
         assertExists(element("settings-add-host"), "the settings list")
-        app.buttons["Done"].firstMatch.tap()
+        press(app.buttons["Done"].firstMatch)
         assertGone(app.navigationBars["Settings"], "settings")
     }
 }

@@ -15,8 +15,9 @@ enum Metrics {
 
 extension View {
     /// Liquid Glass where the system has it (iOS 26), a blurred translucent card before that.
-    func glass<S: Shape>(in shape: S, tint: Color? = nil, interactive: Bool = false) -> some View {
-        modifier(GlassBackground(shape: shape, tint: tint, interactive: interactive))
+    /// Put it around controls, not inside a button's label.
+    func glass<S: Shape>(in shape: S, tint: Color? = nil) -> some View {
+        modifier(GlassBackground(shape: shape, tint: tint))
     }
 
     /// Rounded card used for code, tool lists and other blocks inside the conversation.
@@ -44,13 +45,12 @@ extension View {
 private struct GlassBackground<S: Shape>: ViewModifier {
     let shape: S
     let tint: Color?
-    let interactive: Bool
 
     func body(content: Content) -> some View {
         // The glass API ships with the iOS 26 SDK; older Xcode versions build the fallback only.
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
-            content.glassEffect(liquidGlass(tint: tint, interactive: interactive), in: shape)
+            content.glassEffect(liquidGlass(tint: tint), in: shape)
         } else {
             content.background { FrostedShape(shape: shape, tint: tint) }
         }
@@ -62,10 +62,9 @@ private struct GlassBackground<S: Shape>: ViewModifier {
 
 #if compiler(>=6.2)
 @available(iOS 26.0, *)
-private func liquidGlass(tint: Color?, interactive: Bool) -> Glass {
+private func liquidGlass(tint: Color?) -> Glass {
     var glass = Glass.regular
     if let tint { glass = glass.tint(tint) }
-    if interactive { glass = glass.interactive() }
     return glass
 }
 #endif

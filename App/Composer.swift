@@ -340,8 +340,9 @@ private struct StatusRow: View {
                     .foregroundStyle(palette.dim)
                     .padding(.horizontal, 12)
                     .frame(height: 30)
-                    .glass(in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .contentShape(Rectangle())
             }
+            .glass(in: RoundedRectangle(cornerRadius: 9, style: .continuous))
             .accessibilityLabel("Permissions: \(model.settings.approvalMode.label)")
             .accessibilityIdentifier("composer-permissions")
         }
